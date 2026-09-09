@@ -1,0 +1,169 @@
+-- Init.lua
+-- Boot sequence. Wires everything together after ADDON_LOADED.
+
+local ALC = _G.ALC
+
+local function boot()
+    -- Reclaim memory from the deprecated ALC_SessionLog SavedVariable. It
+    -- was write-only fallback persistence that nothing on the addon side
+    -- or backend side ever read, but it grew unbounded for 30 days
+    -- (~290 KB per encounter * many encounters per session) and on heavy
+    -- raiders pushed the Lua VM past its allocation cap mid-combat,
+    -- producing "memory allocation error: block too big" on inspect-side
+    -- handlers. WoW's SavedVariables loader still dofile()s the existing
+    -- on-disk blob into _G.ALC_SessionLog before our addon boots, so we
+    -- nil it here to let the GC reclaim it immediately. The variable is
+    -- no longer declared in the .toc, so on next save WoW writes only
+    -- the still-declared variables and the bloat drops off disk too.
+    -- Safe to remove this block in a future version once we're confident
+    -- everyone has cycled through one save with 0.30.13+.
+    _G.ALC_SessionLog = nil
+
+    -- Seed config with defaults
+    _G.ALC_Config = _G.ALC_Config or {}
+    for k, v in pairs(ALC.Core.Constants.DEFAULT_CONFIG) do
+        if ALC_Config[k] == nil then
+            ALC_Config[k] = v
+        end
+    end
+
+    -- Detect server family BEFORE any module starts so they can branch on
+    -- ALC.Profile during their .start() hooks. Sets ALC.Profile to one of
+    -- "triumvirate" | "frostmourne" | "unknown" and caches to ALC_Config.
+    ALC.Core.Profile.detect()
+
+    -- Hot-swap guard: when the addon is updated in place while the game is
+    -- running, /reload re-reads EXISTING files but the client's .toc file
+    -- list is cached from launch, so files ADDED by the update (like
+    -- Core/Branding.lua in 0.63.0) never load. Shim the defaults so the
+    -- session keeps working, and tell the player a full game restart finishes
+    -- the update. Fresh installs and restarted clients never take this path.
+    --
+    -- These literals must stay in sync with the matching brand entry in
+    -- Core/Branding.lua. They are duplicated rather than required, because the
+    -- entire point of this branch is that Branding.lua could not be loaded.
+    if not ALC.Core.Branding then
+        local FALLBACK = {
+            short       = "Triumvirate Logs",
+            full        = "Triumvirate Logs Companion",
+            slash       = "tlc",
+            accent      = "4ec3ff",
+            domain      = "triumlogs.gg",
+            releasesUrl = "https://github.com/FangYuanWoW/triumvirate-logs-companion/releases",
+        }
+        local B = {}
+        function B.current()     return FALLBACK end
+        function B.titleGreen()  return "|cff00ff00" .. FALLBACK.full .. "|r" end
+        function B.titleRich()   return "|cff" .. FALLBACK.accent .. FALLBACK.short .. "|r |cffe8e8e8Companion|r" end
+        function B.short()       return FALLBACK.short end
+        function B.full()        return FALLBACK.full end
+        function B.slash()       return FALLBACK.slash end
+        function B.domain()      return FALLBACK.domain end
+        function B.releasesUrl() return FALLBACK.releasesUrl end
+        ALC.Core.Branding = B
+        ALC.Core.Logger.warn("Addon updated while the game was running - fully exit and restart WoW to finish the update (/reload is not enough).")
+    end
+
+    -- Register the brand-specific slash alias now that the profile is known
+    -- (e.g. /tlc on Triumvirate). Slash tokens registered at file-load can't be
+    -- brand-aware because Profile isn't set yet; /alc stays a universal alias.
+    local brandSlash = ALC.Core.Branding.slash()
+    if brandSlash and brandSlash ~= "alc" then
+        _G.SLASH_ALC3 = "/" .. brandSlash
+    end
+
+    -- Re-tag chat lines for the active brand (e.g. [TLC] on Triumvirate).
+    ALC.Core.Logger.applyBrand()
+
+    -- Per-character state
+    ALC.Parser.Session.init()
+
+    -- Rehydrate inspect cache
+    ALC.Capture.InspectCache.rehydrate()
+
+    -- Start subsystems (order matters: the relay must be ready to receive
+    -- chunks before SnapshotPipeline starts producing them).
+    -- Each wrapped in pcall so one bad module doesn't break the whole addon.
+    local function safeStart(name, mod)
+        if not mod or type(mod.start) ~= "function" then
+            ALC.Core.Logger.error(name .. ": module or .start missing")
+            return
+        end
+        local ok, err = pcall(mod.start)
+        if not ok then
+            ALC.Core.Logger.error(name .. ".start() errored: " .. tostring(err))
+        else
+            ALC.Core.Logger.debug(name .. " started")
+        end
+    end
+
+    safeStart("ZoneMonitor", ALC.Zone.ZoneMonitor)
+    safeStart("EncounterDetector", ALC.Parser.EncounterDetector)
+    safeStart("EncounterTracker", ALC.Capture.EncounterTracker)
+    safeStart("SpellFailedRelay", ALC.Transport.SpellFailedRelay)
+    safeStart("AddonChannel", ALC.Transport.AddonChannel)
+    safeStart("VersionCheck", ALC.Transport.VersionCheck)
+    safeStart("InspectLoop", ALC.Capture.InspectLoop)
+    safeStart("SnapshotPipeline", ALC.Capture.SnapshotPipeline)
+    safeStart("PetPipeline", ALC.Capture.PetPipeline)
+    -- PetTracker MUST start after SnapshotPipeline so its PLAYER_REGEN_DISABLED
+    -- handler is registered (and thus fires) AFTER SnapshotPipeline's, which
+    -- calls SpellFailedRelay.clearQueue() at pull-start. PetTracker enqueues
+    -- the fresh pet-pair sweep into the now-empty queue.
+    safeStart("PetTracker", ALC.Capture.PetTracker)
+    -- GuardianTracker resolves slot-less proc-guardians (no SPELL_SUMMON,
+    -- no pet unit slot) to owners via tooltip scan and feeds the same PP
+    -- lane as PetTracker. Its CLEU handler has no ordering dependency; it
+    -- boots after PetPipeline for the same reason PetTracker does.
+    safeStart("GuardianTracker", ALC.Capture.GuardianTracker)
+    -- Telemetry boots last among capture modules. It only emits while
+    -- combat-logging in a raid/party instance and gates on relay queue
+    -- depth, so it's safe to run alongside CI + PP transit on the same
+    -- SpellFailedRelay.
+    safeStart("Telemetry", ALC.Capture.Telemetry)
+    -- MythicAioScan MUST start before KeystoneScan: on a client with no
+    -- C_MythicPlus it attaches itself as KeystoneScan's keystone source, and
+    -- KeystoneScan's availability check reads that on ITS start. Inert
+    -- everywhere else (Triumvirate + AIO only).
+    safeStart("MythicAioScan", ALC.Capture.MythicAioScan)
+    -- KeystoneScan arms the Mythic+ lifecycle events (start/complete). It is
+    -- event-driven and no-ops where neither C_MythicPlus nor an external
+    -- source exists, so it's cheap to boot alongside the other capture modules.
+    safeStart("KeystoneScan", ALC.Capture.KeystoneScan)
+    -- ManastormScan arms the Manastorm level-clear event (retired tenant only; no-ops where
+    -- C_Manastorm is absent). One success record per MANASTORM_LEVEL_COMPLETED.
+    safeStart("ManastormScan", ALC.Capture.ManastormScan)
+    safeStart("MinimapButton", ALC.UI.MinimapButton)
+
+    ALC.Core.Logger.info(ALC.Core.Branding.titleGreen() .. " v" .. ALC.Core.Constants.VERSION .. " loaded.  |cffffd200/" .. ALC.Core.Branding.slash() .. "|r for settings.")
+
+    -- First-boot sanity probe. Debug-only, and deliberately reports the
+    -- detected profile rather than probing for custom-client namespaces this
+    -- build no longer reads.
+    if ALC_Config.debug then
+        ALC.Core.Logger.debug("Server profile: " .. tostring(ALC.Profile))
+        ALC.Core.Logger.debug("Native transmog: "
+            .. tostring(ALC.Core.Profile.hasNativeTransmog()))
+    end
+end
+
+local bootFrame = CreateFrame("Frame")
+bootFrame:RegisterEvent("ADDON_LOADED")
+bootFrame:RegisterEvent("PLAYER_LOGIN")
+bootFrame:RegisterEvent("PLAYER_LOGOUT")
+bootFrame:SetScript("OnEvent", function(self, event, arg1)
+    if event == "ADDON_LOADED" and arg1 == ALC.Core.Constants.ADDON_FOLDER then
+        boot()
+        self:UnregisterEvent("ADDON_LOADED")
+    elseif event == "PLAYER_LOGIN" then
+        -- Peer broadcast join-storm window starts now
+        if ALC.Transport.AddonChannel then
+            ALC.Transport.AddonChannel.markJoin()
+        end
+    elseif event == "PLAYER_LOGOUT" then
+        -- Persist metrics snapshot so post-raid analysis survives the session
+        if ALC.Core.Metrics then
+            ALC.Core.Metrics.persist()
+        end
+    end
+end)

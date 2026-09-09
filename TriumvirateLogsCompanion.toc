@@ -1,0 +1,62 @@
+## Interface: 30300
+## Title: |cff4ec3ffTriumvirate Logs|r |cffe8e8e8Companion|r
+## Notes: Inspects gear and talents per encounter for triumlogs.gg. Auto-inspects the raid in the background.
+## Author: FangYuanWoW
+## Version: 0.74.0
+## SavedVariables: ALC_Config, ALC_Peers
+## SavedVariablesPerCharacter: ALC_LocalState, ALC_InspectCache, ALC_InspectCacheMeta, TLC_KeystoneRuns
+## OptionalDeps: Ace3
+
+embeds.xml
+
+Core\Namespace.lua
+Core\Constants.lua
+Core\Logger.lua
+Core\Queue.lua
+Core\Serialize.lua
+Core\Base64.lua
+Core\Transport8.lua
+Core\DictD1.lua
+Core\Frame.lua
+Core\Hash.lua
+Core\Metrics.lua
+Core\Profile.lua
+Core\Branding.lua
+
+Capture\LocalScan.lua
+Capture\MysticEnchantScan.lua
+Capture\CAOScan.lua
+Capture\StockTalentScan.lua
+Capture\GearScan.lua
+Capture\InspectCache.lua
+Capture\EncounterTracker.lua
+Capture\InspectLoop.lua
+Capture\PrimaryStatScan.lua
+Capture\FrameBuilder.lua
+Capture\SnapshotPipeline.lua
+Capture\PetPipeline.lua
+Capture\PetTracker.lua
+Capture\GuardianTracker.lua
+Capture\Telemetry.lua
+Capture\MythicAioScan.lua
+Capture\KeystoneScan.lua
+Capture\ManastormScan.lua
+
+Transport\AddonChannel.lua
+Transport\SpellFailedRelay.lua
+Transport\VersionCheck.lua
+
+Zone\DefaultZones.lua
+Zone\BossRegistry.lua
+Zone\ZoneMonitor.lua
+
+Parser\Session.lua
+Parser\EncounterDetector.lua
+
+UI\SettingsFrame.xml
+UI\SettingsFrame.lua
+UI\MinimapButton.lua
+UI\KeystoneDrain.lua
+UI\SlashCommand.lua
+
+Init.lua

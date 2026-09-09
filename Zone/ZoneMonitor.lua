@@ -1,0 +1,392 @@
+-- Zone/ZoneMonitor.lua
+-- Auto-toggles /combatlog on zone transitions.
+--
+-- 0.2.3: only main-zone changes (ZONE_CHANGED_NEW_AREA + PLAYER_ENTERING_WORLD)
+-- drive auto-logging. Sub-zone events (ZONE_CHANGED, ZONE_CHANGED_INDOORS) are
+-- not registered. Tradeoff: outdoor world-boss subzones (Lord Kazzak in
+-- Tainted Scar, Scarab Wall, Doomwalker in Snowblind Hills, etc.) no longer
+-- auto-trigger logging on entry - they need a manual /combatlog. We accept
+-- this to keep behavior predictable inside indoor instances, where sub-zone
+-- noise was causing surprise re-starts (see e_shikari report on v0.2.0/0.2.1).
+--
+-- Coexistence: checks LoggingCombat() before calling /combatlog, so if
+-- another addon (FangYuanWoW/CombatLogs) has already enabled logging, we
+-- no-op rather than toggling it off.
+--
+-- 0.68.0: two per-content-type gates - log_dungeons and log_raids - decide
+-- whether a zone is allowed to auto-log at all. They are enforced at the very
+-- top of Z.check(), ahead of both the monitored-zone match and the
+-- lastLoggedZone dedupe, because silent mode never auto-stops: a session
+-- started in a dungeon would otherwise keep writing straight through the raid
+-- the user opted out of, and a gate behind the dedupe would never fire when a
+-- toggle is flipped while the player is already standing in the zone.
+-- Entering blocked content therefore STOPS an ALC-started session; a
+-- /combatlog the user turned on themselves is never touched.
+
+local ALC = _G.ALC
+local Z = {}
+ALC.Zone.ZoneMonitor = Z
+
+Z.lastLoggedZone = nil
+Z.startedByUs = false
+Z.popupShownForZone = nil  -- track which zone we popped for, to avoid re-spam within the same visit
+Z.pendingZone = nil        -- zone awaiting the player's answer on the start prompt
+
+-- Popup shown when leaving a monitored zone where ALC started logging.
+-- Asks before stopping rather than auto-stopping, since players often
+-- want to keep logging through trash/town/etc. before re-engaging.
+StaticPopupDialogs["ALC_COMBATLOG_STOP_PROMPT"] = {
+    text = "",  -- set dynamically per zone
+    button1 = "Stop logging",
+    button2 = "Keep logging",
+    OnAccept = function()
+        if LoggingCombat() then
+            SlashCmdList["COMBATLOG"]("")
+            if ALC.Core.Logger then
+                ALC.Core.Logger.info("Combat logging stopped.")
+            end
+        end
+        Z.startedByUs = false
+        Z.lastLoggedZone = nil
+        Z.popupShownForZone = nil
+    end,
+    OnCancel = function()
+        -- User wants to keep logging through this zone. Clear the zone tag
+        -- so the next non-monitored zone change doesn't immediately re-fire
+        -- the stop popup, but KEEP startedByUs = true so we re-engage the
+        -- prompt the next time they leave a monitored zone (re-entering one
+        -- via the silent "claim state" branch keeps our ownership intact).
+        Z.lastLoggedZone = nil
+        Z.popupShownForZone = nil
+    end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+    preferredIndex = 3,
+}
+
+-- Popup shown when ALC starts /combatlog on entering a monitored zone.
+-- Buttons: OK (keep logging), Do Not Log (stop), and conditionally
+-- Hide Transmog (opt-in cleaner-captures action when transmog viewing
+-- is currently on). The third button + warning text is added at show
+-- time only when C_Appearance.CanSeeAppearances() is true; otherwise
+-- the popup stays compact.
+-- Consent popup. ASKS FIRST, then starts - see beginLogging()'s comment for
+-- why the order matters.
+StaticPopupDialogs["ALC_COMBATLOG_START_PROMPT"] = {
+    text = "",  -- set dynamically per zone
+    button1 = "Start logging",
+    button2 = "Not now",
+    button3 = nil,  -- set dynamically when transmog viewing is on
+    OnAccept = function()
+        local zone = Z.pendingZone
+        Z.pendingZone = nil
+        if zone then Z.beginLogging(zone) end
+    end,
+    OnCancel = function()
+        -- Declined for this entry. There is nothing to undo: /combatlog was
+        -- never touched, so no dated log file was created. Reset state so the
+        -- next zone-in to a monitored zone asks again. We do NOT remember the
+        -- decline across zone-out + zone-back-in - the intent is "ask me every
+        -- time I come back," not "never log this zone for the rest of the
+        -- session." (Main-zone-only registration ensures sub-zone walks within
+        -- the same visit don't re-fire the popup, so per-entry is safe.)
+        Z.pendingZone = nil
+        Z.startedByUs = false
+        Z.lastLoggedZone = nil
+        Z.popupShownForZone = nil  -- so re-entry to a monitored zone re-prompts
+    end,
+    OnAlt = function()
+        -- Third button: hide transmog (preserving the spell-visuals state) and
+        -- then start logging, so one click both consents and cleans up gear
+        -- capture. It has to start logging itself now that the popup runs
+        -- BEFORE /combatlog rather than after it.
+        if _G.C_Appearance and type(C_Appearance.CanSeeAppearances) == "function"
+           and type(C_Appearance.SetCanSeeAppearances) == "function" then
+            local ok, _, spellVisuals = pcall(C_Appearance.CanSeeAppearances)
+            if ok then
+                pcall(C_Appearance.SetCanSeeAppearances, false, spellVisuals)
+                if ALC.Core.Logger then
+                    ALC.Core.Logger.info("Transmog viewing disabled. Captures will use real gear.")
+                end
+                -- Defer the panel refresh - CanSeeAppearances reads the
+                -- live setting state, which doesn't update synchronously
+                -- after SetCanSeeAppearances. A 0.1s delay is enough for
+                -- the next frame's read to return the new value.
+                local doRefresh = function()
+                    if ALC.UI and ALC.UI.SettingsFrame and ALC.UI.SettingsFrame.refreshCheckboxes then
+                        ALC.UI.SettingsFrame.refreshCheckboxes()
+                    end
+                end
+                if _G.C_Timer and C_Timer.After then
+                    C_Timer.After(0.1, doRefresh)
+                else
+                    -- Fallback: OnUpdate one-shot
+                    local f = CreateFrame("Frame")
+                    local started = GetTime()
+                    f:SetScript("OnUpdate", function(self, el)
+                        if GetTime() - started >= 0.1 then
+                            self:SetScript("OnUpdate", nil)
+                            doRefresh()
+                        end
+                    end)
+                end
+            end
+        end
+        local zone = Z.pendingZone
+        Z.pendingZone = nil
+        if zone then Z.beginLogging(zone) end
+    end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+    preferredIndex = 3,
+}
+
+local function currentZone()
+    local zoneName = GetZoneText()
+    local instanceName = GetInstanceInfo()
+    return (instanceName and instanceName ~= "" and instanceName) or zoneName
+end
+
+local function zoneIsMonitored(name)
+    if not name or not _G.ALC_Config or not ALC_Config.monitored_zones then
+        return false
+    end
+    local lower = name:lower()
+    for zone, enabled in pairs(ALC_Config.monitored_zones) do
+        if enabled and zone:lower() == lower then return true end
+    end
+    return false
+end
+
+-- Manastorm awareness (retired tenant). Inside a Manastorm the per-level instance name is the
+-- recycled boss's HOME dungeon (RFK / Scarlet Monastery / Deadmines / ...), so it
+-- thrashes across level transitions and may not be in monitored_zones at all -
+-- the normal name match misses the run. Returns false where the API is absent (C_Manastorm
+-- absent -> ManastormScan.isInManastorm() is false), so this is inert elsewhere.
+local function inManastorm()
+    local MS = ALC.Capture.ManastormScan
+    return (MS and MS.isInManastorm and MS.isInManastorm()) or false
+end
+
+-- Content classification for the per-content-type logging gates ("Log 5-man
+-- dungeons" / "Log raids and world bosses"). IsInInstance() is authoritative
+-- for anything instanced; outdoor world bosses and raid-event subzones report
+-- instanceType "none", so those fall back to the DefaultZones name table.
+-- Returns "raid", "dungeon", or nil for content we can't positively identify
+-- (a hand-added zone, open world) - unidentified content is never gated.
+local function contentKind(zoneName)
+    local _, instanceType = IsInInstance()
+    if instanceType == "raid"  then return "raid" end
+    if instanceType == "party" then return "dungeon" end
+    local outdoor = ALC.Zone.DefaultZones and ALC.Zone.DefaultZones.OUTDOOR_RAID_ZONES
+    if zoneName and outdoor and outdoor[zoneName:lower()] then return "raid" end
+    return nil
+end
+
+-- Returns the content kind when the user has switched logging OFF for it,
+-- nil otherwise. Missing config keys read as ON, matching the settings panel's
+-- getters, so a config saved before either toggle existed keeps logging.
+-- Manastorm is never gated: it is a scaling scenario running inside recycled
+-- dungeon maps, and it has its own opt-out (manastorm_enabled).
+local function blockedContentKind(zoneName)
+    if inManastorm() then return nil end
+    local c = _G.ALC_Config or {}
+    local kind = contentKind(zoneName)
+    if kind == "dungeon" and c.log_dungeons == false then return "dungeon" end
+    if kind == "raid"    and c.log_raids    == false then return "raid" end
+    return nil
+end
+
+local CONTENT_LABEL = {
+    raid    = "a raid or world boss",
+    dungeon = "a 5-man dungeon",
+}
+
+-- Enforce the content gates for the zone we're standing in. Returns true when
+-- the zone is blocked, in which case nothing else in Z.check should run.
+--
+-- Stops an in-flight session rather than only declining to start one: silent
+-- mode never auto-stops, so a session started in a dungeon would otherwise
+-- keep writing straight through the raid the user opted out of. Only a session
+-- WE started is stopped - a /combatlog the user turned on themselves is their
+-- own call and is left alone.
+local function enforceContentGate(zoneName)
+    local blocked = blockedContentKind(zoneName)
+    if not blocked then return false end
+
+    local label = CONTENT_LABEL[blocked]
+    if Z.startedByUs and LoggingCombat() then
+        SlashCmdList["COMBATLOG"]("")
+        ALC.Core.Logger.info("Combat logging stopped: " .. zoneName .. " is "
+            .. label .. ", and logging there is turned off.")
+    else
+        ALC.Core.Logger.debug("Skipping auto-/combatlog: " .. zoneName .. " is "
+            .. label .. ", and logging there is turned off.")
+    end
+    -- Full reset (rather than tagging this zone as the last logged one): with
+    -- the zone tag clear, turning the toggle back on re-engages this same zone
+    -- through Z.check() without the user having to zone out and back in.
+    Z.startedByUs = false
+    Z.lastLoggedZone = nil
+    Z.popupShownForZone = nil
+    Z.pendingZone = nil
+    return true
+end
+
+-- Flip /combatlog on and claim the session as ours. Split out of
+-- startLogging so the consent popup can call it on accept: the popup now runs
+-- BEFORE logging starts, so accepting is what actually starts it.
+function Z.beginLogging(zoneName)
+    if LoggingCombat() then return end
+    SlashCmdList["COMBATLOG"]("")
+    Z.lastLoggedZone = zoneName
+    Z.startedByUs = true
+    ALC.Core.Logger.info("Combat logging started for: " .. zoneName)
+end
+
+local function startLogging(zoneName, showPopup)
+    if LoggingCombat() then
+        -- Someone else already started it (or user kept it on across zones).
+        -- Claim state without toggling so we still track this as ours, and
+        -- tell the user explicitly so they know nothing was changed.
+        local wasOurs = Z.startedByUs
+        Z.lastLoggedZone = zoneName
+        if wasOurs then
+            ALC.Core.Logger.info("Combat log already active for: " .. zoneName)
+        else
+            ALC.Core.Logger.info("Combat log already on (started elsewhere) for: " .. zoneName)
+        end
+        return
+    end
+    if not ALC_Config.auto_combatlog_on_raid then return end
+
+    -- ASK FIRST. Do not touch /combatlog until the player says yes.
+    --
+    -- This used to start logging and then show the popup, which made
+    -- declining destructive rather than free: the client begins a NEW dated
+    -- combat-log file on every off->on transition, so a start-then-decline
+    -- left a stub file behind holding the handful of seconds between zoning
+    -- in and clicking the button. Measured 2026-09-04 on a Mythic+ session:
+    -- 19 dated files totalling 180 KB, each spanning 2-10 seconds, because
+    -- every dungeon zone-in auto-started and was then declined. The same
+    -- client logs a raid the player says yes to as ONE continuous 195 MB
+    -- file. Asking first makes "Not now" a genuine no-op.
+    --
+    -- Show it ONLY on a main zone change (showPopup), and ONLY once per zone
+    -- entry, so crossing sub-zones inside cannot re-ask.
+    if showPopup then
+        if Z.popupShownForZone == zoneName then return end
+        Z.popupShownForZone = zoneName
+        Z.pendingZone = zoneName
+        local popup = StaticPopupDialogs["ALC_COMBATLOG_START_PROMPT"]
+
+        -- Detect whether the user currently has other-player transmog
+        -- visible. If on, surface a warning + opt-in third button so
+        -- they can hide transmog right here for cleaner captures
+        -- without having to open /alc settings mid-pull.
+        local transmogOn = false
+        if _G.C_Appearance and type(C_Appearance.CanSeeAppearances) == "function" then
+            local ok, t = pcall(C_Appearance.CanSeeAppearances)
+            transmogOn = ok and t and true or false
+        end
+
+        local baseText =
+            "|T" .. ALC.Core.Constants.MEDIA_PATH .. "logo-128.tga:32:32:0:0|t  " .. ALC.Core.Branding.titleRich() .. "\n" ..
+            "|cff555555------------------------------|r\n" ..
+            "Start |cffffd200/combatlog|r for:\n" ..
+            "|cff00ffff" .. zoneName .. "|r\n\n" ..
+            "Output: |cffaaaaaaLogs\\WoWCombatLog.txt|r"
+
+        if transmogOn then
+            popup.text = baseText
+                .. "\n\n|cffff8800Transmog viewing is ON.|r Captured gear may show vanity items in place of real gear. ALC retries to detect the real items, but it isn't always accurate.\n\n"
+                .. "|cffaaaaaaClick |r|cffffd200Hide Transmog|r|cffaaaaaa to disable for cleaner captures. Re-enable any time via |r|cffffd200/alc|r|cffaaaaaa settings or the wardrobe pane's Disable/Enable Transmog button.|r"
+            popup.button3 = "Hide Transmog"
+        else
+            popup.text = baseText
+            popup.button3 = nil
+        end
+
+        StaticPopup_Show("ALC_COMBATLOG_START_PROMPT")
+        return
+    end
+
+    -- No popup wanted: either silent mode, or a settings toggle was flipped
+    -- while the player is already standing in the zone. Both are an explicit
+    -- action by the player, so starting without asking is the expected result.
+    Z.beginLogging(zoneName)
+end
+
+local function stopLoggingIfWeStarted()
+    if Z.startedByUs and LoggingCombat() then
+        SlashCmdList["COMBATLOG"]("")
+        ALC.Core.Logger.info("Combat logging stopped.")
+    end
+    Z.startedByUs = false
+    Z.lastLoggedZone = nil
+    Z.pendingZone = nil
+    -- Reset popup tracking so re-entering the zone shows the popup again
+    Z.popupShownForZone = nil
+end
+
+function Z.check(isMainZoneChange)
+    local zone = currentZone()
+    -- Collapse a Manastorm to one stable monitored zone so we prompt once on
+    -- entry and never fire the "left monitored zone" stop prompt as you warp
+    -- between levels (each level reports its boss's home-dungeon name).
+    if inManastorm() then zone = "The Manastorm" end
+
+    -- Content gate first, ahead of the lastLoggedZone dedupe below. Flipping
+    -- "Log raids and world bosses" off calls straight in here while the player
+    -- is standing in the raid, and at that point lastLoggedZone already equals
+    -- the current zone - a gate behind the dedupe would never fire and the
+    -- session would keep running until the next zone change.
+    if enforceContentGate(zone) then return end
+
+    local monitored = zoneIsMonitored(zone) or inManastorm()
+    local silent = _G.ALC_Config and ALC_Config.silent_auto_logging
+
+    if monitored and Z.lastLoggedZone ~= zone then
+        -- In silent mode, suppress the start popup. Logging still starts.
+        startLogging(zone, isMainZoneChange and not silent)
+    elseif not monitored and Z.lastLoggedZone and Z.startedByUs and isMainZoneChange and not silent then
+        -- Left a monitored area where WE started logging. Prompt rather than
+        -- auto-stop: players often want to keep logging through town/world
+        -- between dungeons or for the inn buff phase before re-pulling.
+        -- Silent mode skips this entirely - logging just stays on.
+        local leftZone = Z.lastLoggedZone
+        StaticPopupDialogs["ALC_COMBATLOG_STOP_PROMPT"].text =
+            "|T" .. ALC.Core.Constants.MEDIA_PATH .. "logo-128.tga:32:32:0:0|t  " .. ALC.Core.Branding.titleRich() .. "\n" ..
+            "|cff555555------------------------------|r\n" ..
+            "Left monitored zone:\n" ..
+            "|cff00ffff" .. leftZone .. "|r\n\n" ..
+            "Stop |cffffd200/combatlog|r?"
+        StaticPopup_Show("ALC_COMBATLOG_STOP_PROMPT")
+    end
+end
+
+function Z.start()
+    _G.ALC_Config = _G.ALC_Config or {}
+    ALC_Config.monitored_zones = ALC_Config.monitored_zones or {}
+    -- Seed defaults for any zone not already explicitly configured
+    for zone, v in pairs(ALC.Zone.DefaultZones.DEFAULTS) do
+        if ALC_Config.monitored_zones[zone] == nil then
+            ALC_Config.monitored_zones[zone] = v
+        end
+    end
+
+    -- Main-zone-only registration. ZONE_CHANGED + ZONE_CHANGED_INDOORS
+    -- intentionally not registered (see file header for rationale).
+    ALC.RegisterEvent("ZONE_CHANGED_NEW_AREA", function() Z.check(true) end)
+    ALC.RegisterEvent("PLAYER_ENTERING_WORLD", function() Z.check(true) end)
+
+    -- Manastorm entry (retired tenant): the scenario teleport may not raise a clean
+    -- ZONE_CHANGED_NEW_AREA we recognize, so also drive the check off the
+    -- Manastorm signals (entry + each level transition). Z.check is idempotent
+    -- (lastLoggedZone collapses to "The Manastorm") so repeats don't re-prompt.
+    -- TryRegisterEvent: these events are absent on the supported clients, so this is inert here.
+    ALC.TryRegisterEvent("ENTER_MANASTORM_RESULT",  function() Z.check(true) end)
+    ALC.TryRegisterEvent("ACTIVE_MANASTORM_UPDATED", function() Z.check(true) end)
+end

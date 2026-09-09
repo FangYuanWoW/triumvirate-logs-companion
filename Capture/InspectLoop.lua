@@ -1,0 +1,1079 @@
+-- Capture/InspectLoop.lua
+-- Priority-queue scheduled NotifyInspect rotation.
+-- One tick every INSPECT_MIN_INTERVAL_S seconds. Each tick: advance queue,
+-- issue one NotifyInspect if a target is due, or no-op.
+
+local ALC = _G.ALC
+local I = {}
+ALC.Capture.InspectLoop = I
+
+local C = ALC.Core.Constants
+
+I.inFlight = nil       -- { guid = ..., started_at = ... }
+I.lastTickAt = 0
+I.ticker = nil         -- OnUpdate handler
+I.unitByGuid = {}      -- GUID -> unit token ("raidN"/"partyN"/"player")
+I.rosterGuids = {}     -- stable roster GUID list used by pickNext rule 1
+I.rosterUnresolved = 0 -- group slots whose UnitGUID() came back nil last rebuild
+I.rosterLastBuild = 0  -- GetTime() of the last rebuildUnitIndex()
+
+local function now()
+    return GetTime()
+end
+
+-- True while the user has any frame open that reads the single global
+-- inspect buffer: their OWN character pane, or an inspect window on another
+-- player. Both surfaces render equipped-slot tooltips (and the inspect
+-- window also renders the 3D model) from that one buffer. NotifyInspect
+-- repoints it and ClearInspectPlayer wipes it, so the background auto-loop
+-- must do NEITHER while one of these is shown - not start a new inspect,
+-- and not clear a finishing one. Details (gears.lua) and Skada
+-- (LibTalentQuery) take the same stance: gate scheduling on the inspect
+-- frame and never call ClearInspectPlayer at all.
+--
+-- Both supported clients are stock 3.3.5, so the stock frame names are the
+-- only ones that exist. A retired custom client used renamed frames and this
+-- predicate checked those too; those globals are absent here, so the extra
+-- checks were always nil-guarded false and have been dropped.
+local function inspectBufferInUse()
+    return (CharacterFrame and CharacterFrame:IsShown())
+        or (InspectFrame and InspectFrame:IsShown())
+end
+
+-- Rebuild GUID->unit and roster-guid indices from current roster state.
+-- This avoids repeated UnitGUID("raidN"/"partyN") scans on every inspect tick.
+--
+-- LOSSY BY NATURE: UnitGUID("raidN") returns nil for a group member the client
+-- has no unit data for (typically out of visible range). Such a slot cannot be
+-- added to the roster, and pickNext can ONLY ever return a GUID that is in
+-- I.rosterGuids or already in the InspectCache - so a member missed here is
+-- invisible to the inspect rotation until the next rebuild puts them in.
+--
+-- That is why we count the misses. Roster EVENTS alone are not enough to
+-- recover: a stable raid fires none, so a single unlucky read used to freeze
+-- the roster for the rest of the night (measured 2026-08-26: a 25-man where the
+-- loop cycled the same 9 peers for 7 minutes and never saw the other 15).
+-- tick() re-runs this while rosterUnresolved > 0; it self-silences at zero.
+local function rebuildUnitIndex()
+    local byGuid = {}
+    local roster = {}
+    local seenRoster = {}
+    local unresolved = 0
+    local selfGuid = UnitGUID("player")
+    if selfGuid then
+        byGuid[selfGuid] = "player"
+    end
+
+    for i = 1, (GetNumRaidMembers() or 0) do
+        local u = "raid" .. i
+        local guid = UnitGUID(u)
+        if guid then
+            byGuid[guid] = u
+            if guid ~= selfGuid and not seenRoster[guid] then
+                roster[#roster + 1] = guid
+                seenRoster[guid] = true
+            end
+        else
+            unresolved = unresolved + 1
+        end
+    end
+
+    for i = 1, (GetNumPartyMembers() or 0) do
+        local u = "party" .. i
+        local guid = UnitGUID(u)
+        if guid then
+            byGuid[guid] = u
+            if guid ~= selfGuid and not seenRoster[guid] then
+                roster[#roster + 1] = guid
+                seenRoster[guid] = true
+            end
+        else
+            unresolved = unresolved + 1
+        end
+    end
+
+    I.unitByGuid = byGuid
+    I.rosterGuids = roster
+    I.rosterUnresolved = unresolved
+    I.rosterLastBuild = now()
+end
+
+-- Peer Character Advancement inspects (custom-client family only), user-toggleable
+-- via ALC_Config.cao_inspect_enabled (Settings panel / "/alc cao off").
+--
+-- Asking for a peer's CA build makes the client resolve every entry id in that
+-- build against its local Character Advancement table. When a game patch retires
+-- an entry id that a character's STORED build still references, the client
+-- throws "CharacterAdvancementBuildEntry::UpdatePointers: entry <id> not found"
+-- while parsing the inspect response and can go down with it. That runs inside
+-- the client's own packet handler, before any addon code - the pcall around
+-- InspectUnit below is at the request, not the response, so there is nothing for
+-- us to catch and nothing to pre-validate. Not asking is the only lever, hence
+-- this toggle.
+--
+-- Off is a real capture loss (peers' talents + hero build), not a free win, so
+-- it defaults ON and is meant to be flipped only while a patch-day breakage is
+-- live. Everything else about a peer inspect - gear, mystic enchants, guild,
+-- race - is unaffected, and the logger's OWN build capture never routes through
+-- here (SnapshotPipeline calls InspectUnit("player") directly; your own build is
+-- already resolved client-side, so it carries no added risk).
+local function caoInspectEnabled()
+    if ALC.Core.Profile.isStockClient() then return false end
+    if _G.ALC_Config and ALC_Config.cao_inspect_enabled == false then return false end
+    return true
+end
+
+-- Transmog-visibility gate. When the user has C_Appearance.SetCanSeeAppearances
+-- disabled, GetInventoryItemLink already returns the real (non-vanity) item,
+-- so all the vanity-overlay capture work is pointless. Skip it to free up
+-- inspect budget for raid coverage. When transmog viewing is on (default
+-- WoW behavior), keep doing the full vanity capture path.
+--
+-- On a stock-client tenant, C_Appearance doesn't exist AND there's no transmog system at all
+-- (verified 2026-04-28 via probe: zero divergence across all slots, no
+-- C_VanityCollection / C_Wardrobe / C_Transmog / a stock-client tenantTransmog globals). So
+-- we short-circuit to false on the stock-client profiles (the stock clients,
+-- both stock vanilla/WotLK with no transmog system) to skip all vanity work.
+local function transmogVisible()
+    if ALC.Core.Profile.isStockClient() then return false end
+    if type(_G.C_Appearance) ~= "table"
+       or type(C_Appearance.CanSeeAppearances) ~= "function" then
+        return true  -- API absent; assume worst case (transmog visible)
+    end
+    local ok, val = pcall(C_Appearance.CanSeeAppearances)
+    return (ok and val) and true or false
+end
+
+-- Forward declaration: vanityPoll calls resolveUnit which is defined below.
+-- Lua resolves locals lexically at parse time, so without this declaration
+-- the reference would resolve to global _G.resolveUnit (nil) and crash at
+-- first poll. Same gotcha that bit v0.1.7's broadcast/scheduleAnnounce; see
+-- custom-client-logs-companion-developer-guide.md "Forward declarations".
+local resolveUnit
+
+-- Lightweight vanity-divergence poll. Replaces the heavy "next_scan_at = +1s"
+-- retry that re-fired full inspects. This only re-reads GetInventoryItemID
+-- (a client-side cache lookup) and patches vanity_item_id onto the cached
+-- gear entries when divergence newly appears.
+--
+-- Self-rescheduling: each poll either finds divergence and stops, or
+-- bumps vanity_check_attempts and queues another poll, up to
+-- VANITY_POLL_MAX_ATTEMPTS. Stops if config disables vanity capture or
+-- if we lose the unit.
+local function vanityPoll(guid)
+    local entry = ALC.Capture.InspectCache.get(guid)
+    if not entry or not entry.ci or not entry.ci.gear then return end
+    if entry.vanity_check_attempts == nil then return end  -- divergence already found, or aborted
+
+    local unit = resolveUnit(guid)
+    if not unit or not UnitExists(unit) or UnitGUID(unit) ~= guid then
+        -- Unit gone (out of range, zoned, deserted); stop polling
+        entry.vanity_check_attempts = nil
+        ALC.Capture.InspectCache.set(guid, entry)
+        return
+    end
+    if not GetInventoryItemID then return end
+
+    local newDiverges = 0
+    for _, gearEntry in ipairs(entry.ci.gear) do
+        local slot = gearEntry.slot
+        if slot then
+            local appearanceId = GetInventoryItemID(unit, slot)
+            if appearanceId and appearanceId ~= gearEntry.item_id
+               and gearEntry.vanity_item_id ~= appearanceId then
+                gearEntry.vanity_item_id = appearanceId
+                newDiverges = newDiverges + 1
+            end
+        end
+    end
+
+    if newDiverges > 0 then
+        entry.vanity_check_attempts = nil
+        entry.vanity_check_pull_id = nil
+        entry.last_success_at = time()
+        ALC.Capture.InspectCache.set(guid, entry)
+        if ALC.Capture.SnapshotPipeline and ALC.Capture.SnapshotPipeline.publishPeerInspects then
+            ALC.Capture.SnapshotPipeline.publishPeerInspects()
+        end
+        ALC.Core.Logger.debug(string.format(
+            "vanityPoll patched %d slot(s) for %s after %d attempt(s)",
+            newDiverges, UnitName(unit) or guid, entry.vanity_check_attempts or 0))
+        return
+    end
+
+    -- No divergence yet; reschedule if we have attempts left
+    local attempts = (entry.vanity_check_attempts or 0) + 1
+    if attempts < C.VANITY_POLL_MAX_ATTEMPTS then
+        entry.vanity_check_attempts = attempts
+        ALC.Capture.InspectCache.set(guid, entry)
+        if _G.C_Timer and C_Timer.After then
+            C_Timer.After(C.VANITY_POLL_INTERVAL_S, function() vanityPoll(guid) end)
+        end
+    else
+        -- Cap reached; give up. No divergence => assume no transmog.
+        entry.vanity_check_attempts = nil
+        ALC.Capture.InspectCache.set(guid, entry)
+    end
+end
+
+-- Public entry point so finalizeInspect can request a poll.
+function I.scheduleVanityPoll(guid)
+    if _G.C_Timer and C_Timer.After then
+        C_Timer.After(C.VANITY_POLL_INTERVAL_S, function() vanityPoll(guid) end)
+    end
+end
+
+local function canInspectUnit(unit)
+    return UnitExists(unit)
+       and UnitIsVisible(unit)
+       and UnitIsConnected(unit)
+       and not UnitCanAttack("player", unit)
+       and not UnitCanAttack(unit, "player")
+       and CanInspect(unit)
+       and UnitClass(unit) ~= nil
+       and CheckInteractDistance(unit, 4)  -- 28y Follow range
+end
+
+-- Assigned (not `local function`) to satisfy the forward declaration above.
+-- `local function` would shadow the forward decl with a fresh local, leaving
+-- vanityPoll's reference still pointing at global nil.
+resolveUnit = function(guid)
+    if not guid then return nil end
+    local cached = I.unitByGuid and I.unitByGuid[guid]
+    if cached and UnitExists(cached) and UnitGUID(cached) == guid then
+        return cached
+    end
+
+    -- Cache might be stale if roster changed without a roster event; refresh once.
+    rebuildUnitIndex()
+    cached = I.unitByGuid and I.unitByGuid[guid]
+    if cached and UnitExists(cached) and UnitGUID(cached) == guid then
+        return cached
+    end
+
+    -- Solo / out-of-group fallback: target / mouseover / focus
+    -- Important for /alc inspect-now to work outside a party.
+    for _, u in ipairs({ "target", "mouseover", "focus" }) do
+        if UnitExists(u) and UnitGUID(u) == guid then return u end
+    end
+    return nil
+end
+
+-- Pick the next GUID to inspect. Priority rules:
+--   1. Roster members with no cache entry at all (first-inspect wins)
+--   2. Raiders not yet captured for the current boss (if boss known)
+--   3. Smallest next_scan_at otherwise
+-- Selection-time reachability. An out-of-range peer is not a CANDIDATE, as
+-- opposed to a candidate we pick and then abandon.
+--
+-- Until 0.71.0 pickNext chose blind and tick() discovered the peer was out of
+-- range afterwards, spent the tick, and returned. gate_fail ran 2.5-2.9x the
+-- number of inspects actually sent, rising with group size, so on a spread
+-- raid most of the loop went on rediscovering that the same people were far
+-- away while reachable peers waited behind them in stable pairs() order.
+--
+-- 0.70.3 tried to fix that by deferring the peer 10s and made raid coverage
+-- sharply worse: raiders cross 28y constantly and the lockout threw away the
+-- windows when they were close. The lesson is that re-testing often is a
+-- FEATURE; what has to go is the cost of a rejection, not its frequency.
+-- Filtering here makes a rejection a boolean instead of a tick, with no
+-- deferral, so a peer who steps into range is eligible on the very next tick.
+--
+-- Also promotes never-captured peers: previously one gate_fail created a cache
+-- entry, which demoted them out of rule 1 into the rule 2/3 crowd. Now they
+-- stay rule-1 priority until they are actually captured.
+local function reachable(guid)
+    if not guid then return false end
+    local unit = resolveUnit(guid)
+    if not unit then return false end
+    if not canInspectUnit(unit) then
+        ALC.Core.Metrics.inc("inspect_unreachable_skip")
+        return false
+    end
+    return true
+end
+
+local function pickNext()
+    local cache = ALC.Capture.InspectCache.snapshot()
+    local nowSec = time()
+    local currentBoss = ALC.Capture.EncounterTracker
+                        and ALC.Capture.EncounterTracker.getCurrentBoss()
+
+    -- Rule 1: missing roster entries (raid + party). Skip self - in raids,
+    -- raid1..raidN includes the player; CanInspect(self) returns false so
+    -- attempting to inspect self burns a tick and dirties inspect_gate_fail.
+    for _, guid in ipairs(I.rosterGuids or {}) do
+        if guid and not cache[guid] and reachable(guid) then
+            return guid
+        end
+    end
+
+    -- Rule 2: prefer raiders we haven't captured for this (boss, pull) tuple.
+    -- Pulling the same boss again (e.g., wipe-retry) bumps pullId, so we
+    -- still re-capture even though boss name didn't change.
+    if currentBoss then
+        local currentPullId = ALC.Capture.EncounterTracker
+                              and ALC.Capture.EncounterTracker.getCurrentPullId()
+                              or 0
+        for guid, entry in pairs(cache) do
+            if not entry.inspect_unavailable
+               and (entry.backoff_until or 0) <= nowSec
+               and (entry.captured_for_boss ~= currentBoss
+                    or entry.captured_for_pull_id ~= currentPullId)
+               and reachable(guid) then
+                return guid
+            end
+        end
+    end
+
+    -- Rule 3: smallest next_scan_at among entries actually due now. Without
+    -- the next_scan_at <= nowSec gate, the loop re-inspects freshly-captured
+    -- party members every tick (their next_scan_at is 5min in the future but
+    -- still the smallest in the cache).
+    --
+    -- When no boss is currently tracked (heroic dungeons not in BossRegistry,
+    -- world content, or EncounterTracker silently failing), we fall back to a
+    -- shorter 60s rescan window so we don't sit on stale data. Raid contexts
+    -- keep the 5-min schedule because Rule 2 already forces fresh captures
+    -- on every boss transition.
+    local nobossRescanS = C.INSPECT_NOBOSS_RESCAN_MS / 1000
+    local bestGuid, bestKey = nil, math.huge
+    for guid, entry in pairs(cache) do
+        if not entry.inspect_unavailable
+           and (entry.backoff_until or 0) <= nowSec then
+            local nextDue = entry.next_scan_at or 0
+            if not currentBoss and entry.last_success_at then
+                nextDue = math.min(nextDue, entry.last_success_at + nobossRescanS)
+            end
+            if nextDue <= nowSec then
+                local key = entry.next_scan_at or 0
+                -- reachable() last: it is the only expensive test here, so let
+                -- the cheap ordering check reject most candidates first.
+                if key < bestKey and reachable(guid) then
+                    bestKey = key
+                    bestGuid = guid
+                end
+            end
+        end
+    end
+    return bestGuid
+end
+
+-- Schedule next scan time for a cache entry based on outcome
+local function scheduleNext(entry, outcome)
+    local nowSec = time()
+    if outcome == "success" then
+        entry.failure_streak = 0
+        entry.partial_attempts = nil  -- reset on a fully-successful capture
+        entry.gear_retry_attempts = nil  -- reset empty-gear retry counter too
+        entry.last_success_at = nowSec
+        entry.next_scan_at = nowSec + (C.INSPECT_RESCAN_MS / 1000)
+        ALC.Core.Metrics.inc("inspect_success")
+    elseif outcome == "partial" then
+        -- The inspect succeeded but the captured CI is missing CAO or mystic
+        -- data (race: client-side state hadn't populated by the time the
+        -- INSPECT_CHARACTER_ADVANCEMENT_RESULT event arrived). Retry quickly.
+        -- Don't bump failure_streak; this isn't a server-side failure.
+        entry.last_success_at = nowSec  -- count it; we DID get partial data
+        entry.next_scan_at = nowSec + 5
+        ALC.Core.Metrics.inc("inspect_partial")
+    elseif outcome == "timeout" then
+        entry.failure_streak = (entry.failure_streak or 0) + 1
+        local backoff = math.min(C.INSPECT_BACKOFF_MAX_S, 2 ^ entry.failure_streak)
+        entry.backoff_until = nowSec + backoff
+        entry.next_scan_at = entry.backoff_until
+        -- No sticky `inspect_unavailable` flag - backoff (capped at
+        -- INSPECT_BACKOFF_MAX_S = 60s) already throttles retries. A live raid
+        -- has plenty of transient causes for inspect failure (stealth, LoS,
+        -- zoned through a portal); permanently giving up after 3 misses
+        -- would silently skip raiders for the rest of the run.
+        ALC.Core.Metrics.inc("inspect_timeout")
+    elseif outcome == "gate_fail" then
+        -- Not a real failure; try again soon when proximity changes.
+        --
+        -- next_scan_at ONLY. 0.70.3 also set backoff_until here, to stop
+        -- pickNext rule 2 handing the same out-of-range peer back every tick,
+        -- and it made raid coverage WORSE: pull 1 fell to 25% and even pull
+        -- 6+, steady at 94-96% across 425 encounters on every prior version,
+        -- fell to 70%. Reverted 0.70.4.
+        --
+        -- The premise was wrong, not the code. Rule 3 already defers on
+        -- next_scan_at, so that change only ever touched rule 2 - and rule 2
+        -- re-picking an out-of-range peer is NOT waste. Raiders cross 28y
+        -- constantly, the distance check is cheap, and re-testing every tick
+        -- is how the loop catches someone during the second they are close
+        -- enough. A 10s lockout throws those windows away.
+        --
+        -- If the tick cost is worth attacking, skip to the NEXT candidate
+        -- within this tick instead of returning; do not defer the peer.
+        entry.next_scan_at = nowSec + 10
+        ALC.Core.Metrics.inc("inspect_gate_fail")
+    end
+end
+
+-- Event-driven finalize. INSPECT_TALENT_READY signals stock 3.3.5 inspect
+-- (gear / vanilla talents / arena teams). Then we wait for two the custom client-
+-- specific events to land before reading CAO + mystic data:
+--   INSPECT_CHARACTER_ADVANCEMENT_RESULT -- C_CharacterAdvancement.InspectUnit response
+--   MYSTIC_ENCHANT_INSPECT_RESULT        -- C_MysticEnchant.Inspect response
+--
+-- Event-driven finalize completes as soon as INSPECT_TALENT_READY +
+-- INSPECT_CHARACTER_ADVANCEMENT_RESULT + MYSTIC_ENCHANT_INSPECT_RESULT
+-- have all fired (vs the prior fixed timer); falls back to a 3s
+-- "have-talent-but-not-CA/ME" cutoff so peers with failed/missing
+-- the custom client inspects still get partial data captured.
+
+local function finalizeInspect()
+    local infl = I.inFlight
+    if not infl or infl.finalized then return end
+    infl.finalized = true
+
+    local unit = infl.unit
+    local ci   = infl.ci
+    if unit and ci and UnitExists(unit) and UnitGUID(unit) == infl.guid then
+        local secondCount = ALC.Capture.GearScan.populatedSlotCount(unit)
+        if secondCount > (infl.firstSlotCount or 0) then
+            ci.gear = ALC.Capture.GearScan.readGear(unit)
+        end
+        -- Vanity re-scan: GetInventoryItemID for inspected units may take
+        -- longer to populate than GetInventoryItemLink. Patch vanity_item_id
+        -- onto whatever entries diverge now. Skipped entirely when the user
+        -- has transmog viewing off, since GetInventoryItemLink already
+        -- returns real gear in that case and divergence detection is moot.
+        if transmogVisible() and ci.gear and GetInventoryItemID then
+            for _, entry in ipairs(ci.gear) do
+                local slot = entry.slot
+                if slot then
+                    local appearanceId = GetInventoryItemID(unit, slot)
+                    if appearanceId and appearanceId ~= entry.item_id then
+                        entry.vanity_item_id = appearanceId
+                    end
+                end
+            end
+        end
+        -- custom-client-only enrichment: mystic enchants + CAO talent state.
+        -- Both APIs are absent on the stock-client profiles (probe-confirmed),
+        -- and the inspect result events for them never fire there.
+        if not ALC.Core.Profile.isStockClient() then
+            if ALC.Capture.MysticEnchantScan then
+                ci.mystic_enchants = {
+                    applied  = ALC.Capture.MysticEnchantScan.readInspectedEnchants(unit),
+                    per_slot = ALC.Capture.MysticEnchantScan.readInspectedEnchantsPerSlot(unit),
+                }
+            end
+            if caoInspectEnabled() and ALC.Capture.CAOScan then
+                ci.specialization = ci.specialization or {}
+                local inspected = ALC.Capture.CAOScan.readCAOForUnit(unit)
+                if inspected then
+                    ci.specialization.active_spec_idx     = inspected.spec_idx
+                    ci.specialization.unlocked_specs      = inspected.unlocked_specs
+                    ci.specialization.ca_known            = inspected.ca_known
+                    ci.specialization.ca_talent_ranks     = inspected.ca_talent_ranks
+                    ci.specialization.ca_talent_max_ranks = inspected.ca_talent_max_ranks
+                    ci.specialization.hero_build          = inspected.hero_build
+                end
+            end
+        end
+
+        -- a stock-client tenant enrichment: rich vanilla 3-tab talent shape on ci.talents.
+        -- The snapshot was captured synchronously in onInspectReady (above)
+        -- to avoid the global-inspect-buffer race; we just copy it across
+        -- here. nil here means buffer-race rejection in onInspectReady;
+        -- the missingTalents check below converts that into a partial-retry.
+        -- Backend dispatches by snapshot's `server` field. The shallow
+        -- specialization.vanilla_talents (rank-only) stays populated by
+        -- LocalScan.buildInspectCI for back-compat with v0.1.x parsers.
+        if ALC.Core.Profile.isStockClient() then
+            ci.talents = infl.talentSnapshot
+        end
+
+        local entry = ALC.Capture.InspectCache.get(infl.guid) or {}
+
+        -- Empty-gear guard (boss-transition re-inspect race). When a boss
+        -- pins, EncounterTracker re-queues the whole raid for an immediate
+        -- re-inspect. On the a stock-client tenant profile we finalize the moment
+        -- INSPECT_TALENT_READY fires, but the inspected unit's gear
+        -- (GetInventoryItemLink) often hasn't ripened yet as raiders scatter
+        -- past the 28y inspect range at pull start - so readGear() comes back
+        -- with zero slots. Caching/publishing that empty read as the boss
+        -- keyframe is what made players render naked on the boss tab even
+        -- though we had captured their gear seconds earlier on the trash pull.
+        --
+        -- Never let an empty gear read replace gear we already hold: carry the
+        -- last-known-good gear forward onto this freshly-stamped CI (talents /
+        -- spec / mystic on `ci` stay fresh). The bounded retry below still
+        -- chases a fresh full read so a genuine mid-raid gear swap that the
+        -- racey first read missed is captured on a follow-up tick.
+        local prevGear = entry.ci and entry.ci.gear
+        local freshGearEmpty = (not ci.gear) or (#ci.gear == 0)
+        local reusedGear = false
+        if freshGearEmpty and prevGear and #prevGear > 0 then
+            ci.gear = prevGear
+            reusedGear = true
+        end
+
+        entry.ci = ci
+        entry.received_via = "inspect"
+        local tracker = ALC.Capture.EncounterTracker
+        entry.captured_for_boss     = tracker and tracker.getCurrentBoss() or nil
+        entry.captured_for_pull_id  = tracker and tracker.getCurrentPullId() or 0
+        if ci then
+            ci.captured_for_boss    = entry.captured_for_boss
+            ci.captured_for_pull_id = entry.captured_for_pull_id
+        end
+
+        -- Detect incomplete captures. When the CA event fires but the
+        -- client hasn't populated GetInspectInfo data yet, readCAOForUnit
+        -- returns nil and ci.specialization.active_spec_idx ends up nil.
+        -- Same kind of race possible on mystic. Retry once, then accept.
+        --
+        -- On a stock-client tenant neither CAO nor mystic exist, so both fields will always
+        -- be missing and the partial-retry would loop forever for nothing.
+        -- Skip CAO/Mystic partial detection entirely on stock clients — but DO
+        -- check missingTalents, since onInspectReady leaves talentSnapshot
+        -- nil whenever the global-inspect-buffer race was detected.
+        local missingCAO, missingMystic, missingTalents = false, false, false
+        if ALC.Core.Profile.isStockClient() then
+            missingTalents = (ci and ci.talents == nil) and true or false
+        else
+            -- Only a real miss when we actually asked. With peer CA inspects
+            -- off the field is absent by design, and counting it would burn a
+            -- partial-retry on every single peer forever.
+            if caoInspectEnabled() then
+                missingCAO = (ci and ci.specialization
+                              and ci.specialization.active_spec_idx == nil) and true or false
+            end
+            missingMystic = (ci and (not ci.mystic_enchants
+                                or not ci.mystic_enchants.applied
+                                or #ci.mystic_enchants.applied == 0))
+        end
+        local outcome = "success"
+        if missingCAO or missingMystic or missingTalents then
+            entry.partial_attempts = (entry.partial_attempts or 0) + 1
+            if entry.partial_attempts <= 1 then
+                outcome = "partial"
+            end
+            -- 2nd attempt also incomplete -> accept; back to normal schedule
+        end
+
+        -- Empty fresh gear read: retry quickly (bounded) to ripen the data or
+        -- catch a gear swap. This fires only on a genuinely empty read - an
+        -- in-range peer with ripe data reads full gear and skips this. We may
+        -- have reused cached gear above (so the published CI isn't naked), but
+        -- an empty fresh read still means we lack THIS pull's gear, so keep
+        -- trying. Counter resets on any non-empty read and per new boss
+        -- (EncounterTracker.invalidateCacheForNewBoss).
+        if freshGearEmpty then
+            entry.gear_retry_attempts = (entry.gear_retry_attempts or 0) + 1
+            if entry.gear_retry_attempts <= C.INSPECT_GEAR_RETRY_MAX then
+                outcome = "partial"
+            end
+            ALC.Core.Metrics.inc("inspect_empty_gear")
+        else
+            entry.gear_retry_attempts = nil  -- got real gear this read
+        end
+        -- Always advance last_success_at on a successful inspect. Earlier
+        -- versions reverted it when gear was unchanged so SnapshotPipeline's
+        -- per-(guid, ts) dedup would skip the iteration; that turned out to
+        -- silently kill peer re-broadcast across rapid wipe-retry pulls
+        -- (2-of-18 coverage on pull #2+). Re-broadcast scope is now per-pull
+        -- in publishPeerInspects, and the demuxer's
+        -- (encounter_id, character_id, source, captured_at) unique
+        -- constraint absorbs any over-emission within a pull.
+        scheduleNext(entry, outcome)
+
+        -- Vanity-staleness poll: when GetInventoryItemLink and GetInventoryItemID
+        -- both return the same value (no divergence), we can't distinguish
+        -- "no transmog" from "API not yet ripened to expose the divergence."
+        -- The transient hybrid state where divergence appears is
+        -- non-deterministic, so we re-poll up to VANITY_POLL_MAX_ATTEMPTS
+        -- times at VANITY_POLL_INTERVAL_S intervals.
+        --
+        -- 0.2.0 redesign: previously this set entry.next_scan_at = +1s, which
+        -- sent the peer back through the full inspect loop tick - re-firing
+        -- NotifyInspect + C_CharacterAdvancement.InspectUnit + C_MysticEnchant.Inspect
+        -- on every retry. Three server packets × 10 retries × 24 peers per pull
+        -- was the dominant baseline-CPU and inspect-loop-budget cost reported
+        -- by Nace in ZG report 7976.
+        --
+        -- The new path uses a self-rescheduling C_Timer.After closure that ONLY
+        -- re-reads GetInventoryItemID for the cached gear slots. No server
+        -- packets, no event roundtrip, no inspect-loop tick consumed. The
+        -- deferred 8s rescan in tick() (below) already proved this read-only
+        -- pattern works for vanity ripening. Cost per poll: 19 GetInventoryItemID
+        -- calls + 19 integer compares = microseconds.
+        if transmogVisible() and outcome == "success" and ci and ci.gear then
+            local newPullId = tracker and tracker.getCurrentPullId() or 0
+            if entry.vanity_check_pull_id ~= newPullId then
+                entry.vanity_check_attempts = 0
+                entry.vanity_check_pull_id = newPullId
+            end
+
+            local divergedSlots = 0
+            for _, gearEntry in ipairs(ci.gear) do
+                if gearEntry.vanity_item_id then
+                    divergedSlots = divergedSlots + 1
+                end
+            end
+
+            if divergedSlots > 0 then
+                entry.vanity_check_attempts = nil
+                entry.vanity_check_pull_id = nil
+            elseif (entry.vanity_check_attempts or 0) < C.VANITY_POLL_MAX_ATTEMPTS then
+                I.scheduleVanityPoll(infl.guid)
+            end
+        end
+
+        ALC.Capture.InspectCache.set(infl.guid, entry)
+        local cycleTime = GetTime() - infl.startedAt
+        ALC.Core.Logger.debug(string.format("Captured CI for %s [boss=%s, ca=%s me=%s, gear=%d, %.2fs] outcome=%s%s",
+            UnitName(unit) or infl.guid,
+            tostring(entry.captured_for_boss),
+            tostring(infl.gotCA), tostring(infl.gotMystic),
+            (ci and ci.gear and #ci.gear) or 0,
+            cycleTime, outcome,
+            (missingCAO and " missingCAO" or "")
+              .. (missingMystic and " missingMystic" or "")
+              .. (missingTalents and " missingTalents" or "")
+              .. (freshGearEmpty and (reusedGear and " emptyGear(reused)" or " emptyGear") or "")))
+    end
+
+    -- Don't clear the inspect buffer out from under the user. When a peer's
+    -- inspect finalizes (event-driven) at the same moment the user has their
+    -- own pane or an inspect window open - common right after a boss kill,
+    -- when the loop queues a fresh full-raid sweep - ClearInspectPlayer()
+    -- blanks the slot tooltips and resets the 3D model on the frame the user
+    -- is looking at. The next NotifyInspect (ours after the frame closes, or
+    -- the user's own) repoints the buffer anyway, so the clear is optional.
+    -- Matches Details / Skada, which never clear at all.
+    if not inspectBufferInUse() then
+        ClearInspectPlayer()
+    end
+    I.inFlight = nil
+end
+
+-- Called from event handlers AND tick(). Decides if we have enough data to
+-- finalize: either all 3 events fired, OR INSPECT_TALENT_READY fired and 3s
+-- has elapsed (CA/ME packets either landed or won't).
+--
+-- On a stock-client tenant there is no CA / Mystic event flow at all, so finalize as soon
+-- as INSPECT_TALENT_READY fires. Probe (2026-04-28) measured the talent
+-- event firing reliably ~+0.22s after NotifyInspect, so this gives us a
+-- ~5x faster cycle on a stock-client tenant than the the custom client 3-event wait would.
+local function tryFinalize()
+    local infl = I.inFlight
+    if not infl or infl.finalized then return end
+    if not infl.gotTalent then return end  -- need stock inspect first
+
+    if ALC.Core.Profile.isStockClient() then
+        finalizeInspect()
+        return
+    end
+
+    -- With peer CA inspects off, INSPECT_CHARACTER_ADVANCEMENT_RESULT can never
+    -- fire (we never sent the request), so treat that leg as satisfied. Without
+    -- this every peer would burn the full 3s cutoff instead of finalizing as
+    -- soon as talents + mystic land.
+    local caWaitDone = infl.gotCA or (not caoInspectEnabled())
+    if (caWaitDone and infl.gotMystic) or (GetTime() - infl.talentAt) >= 3.0 then
+        finalizeInspect()
+    end
+end
+
+-- Defer the actual readGear/buildInspectCI by INSPECT_FLIP_DELAY_S after
+-- INSPECT_TALENT_READY fires.
+--
+-- Empirical observation 2026-04-29 via /aip probe on a Shaman peer with the
+-- the custom client q=6/ilvl=1 mythic appearance system (Fel Betrayer set):
+-- GetInventoryItemLink initially returns the VISUAL appearance item id
+-- (cached pre-inspect) and FLIPS to the real underlying item id at ~290ms
+-- after INSPECT_TALENT_READY. No event signals the flip. Reading at +0ms
+-- (the prior behavior) captured the q=6/ilvl=1 cosmetic items as if they
+-- were real gear -- silent data corruption that misrepresented T2 raid
+-- shamans as wearing ilvl-10 trash. Reading at +400ms gives margin past
+-- the 290ms flip while staying inside the 1.0s inspect tick budget so
+-- cold-cycle time is unchanged.
+--
+-- For peers without the mythic-appearance system the link doesn't flip,
+-- so the wait is unused but bounded inside the tick window. Net cycle
+-- time on a 25-man cold cycle: still ~25s.
+local function onInspectReady()
+    local infl = I.inFlight
+    if not infl then return end
+    local sessionId = _G.ALC_LocalState and _G.ALC_LocalState.session_id
+
+    -- STOCK-CLIENT ONLY (the stock clients): snapshot talents synchronously
+    -- NOW, while WoW's global
+    -- inspect buffer is freshest (this event just fired). The +400ms gear
+    -- flip delay below leaves a window in which any other NotifyInspect
+    -- (peer addon, raid frame mouseover, user right-click inspect) would
+    -- clobber the buffer, and a delayed read of GetTalentInfo would return
+    -- the wrong player's data. We park the validated snapshot on the
+    -- in-flight record; finalizeInspect copies it into ci.talents instead
+    -- of re-reading a possibly-stale buffer.
+    --
+    -- Validation: tab names must match the inspected unit's class. WoW
+    -- 3.3.5 has no per-unit talent cache exposed to Lua; tab-name
+    -- mismatch is the only in-process signal that the buffer was clobbered.
+    --
+    -- BB profile is unaffected: it uses C_CharacterAdvancement.InspectUnit,
+    -- which is per-unit-keyed in the client and not subject to this race.
+    if ALC.Core.Profile.isStockClient()
+       and ALC.Capture.StockTalentScan
+       and not infl.talentSnapshot then
+        local readUnit = resolveUnit(infl.guid)
+        if readUnit and UnitGUID(readUnit) == infl.guid then
+            local snap = ALC.Capture.StockTalentScan.readInspectedTalents(readUnit)
+            local _, classToken = UnitClass(readUnit)
+            if snap and ALC.Capture.StockTalentScan.validateForClass(snap, classToken) then
+                infl.talentSnapshot = snap
+            else
+                ALC.Core.Metrics.inc("inspect_talent_buffer_race")
+                local got = "?"
+                if snap and snap.talent_groups and snap.talent_groups[1]
+                   and snap.talent_groups[1].tabs and snap.talent_groups[1].tabs[1] then
+                    got = snap.talent_groups[1].tabs[1].name or "?"
+                end
+                ALC.Core.Logger.debug(string.format(
+                    "Talent buffer race: %s expected class=%s got tab1=%s",
+                    UnitName(readUnit) or infl.guid, tostring(classToken), got))
+            end
+        end
+    end
+
+    local doRead = function()
+        -- Re-validate in-flight state in case the timer fired after a
+        -- target/roster change cleared I.inFlight or replaced the inflight.
+        if not I.inFlight or I.inFlight ~= infl then return end
+        if infl.gotTalent then return end  -- already read, idempotent
+
+        local unit = resolveUnit(infl.guid)
+        if not unit or UnitGUID(unit) ~= infl.guid then
+            -- Target moved / roster changed during the flip-wait window
+            I.inFlight = nil
+            if not inspectBufferInUse() then ClearInspectPlayer() end
+            return
+        end
+        -- Build the CI now (post-flip). CAO + mystic merge in via
+        -- finalizeInspect once their events fire (or 3s elapses).
+        infl.unit = unit
+        infl.ci = ALC.Capture.LocalScan.buildInspectCI(unit, sessionId)
+        infl.firstSlotCount = ALC.Capture.GearScan.populatedSlotCount(unit)
+        infl.gotTalent = true
+        infl.talentAt  = GetTime()
+        tryFinalize()
+    end
+
+    if _G.C_Timer and type(C_Timer.After) == "function" then
+        C_Timer.After(C.INSPECT_FLIP_DELAY_S, doRead)
+    else
+        -- Fallback: no C_Timer available, read immediately (3.3.5 forks
+        -- without C_Timer can't benefit from the flip delay; mythic-
+        -- appearance peers will still capture poisoned data on those forks).
+        doRead()
+    end
+end
+
+local function onCAResult()
+    local infl = I.inFlight
+    if not infl then return end
+    infl.gotCA = true
+    tryFinalize()
+end
+
+local function onMysticResult()
+    local infl = I.inFlight
+    if not infl then return end
+    infl.gotMystic = true
+    tryFinalize()
+end
+
+-- Scheduler tick: called every INSPECT_MIN_INTERVAL_S
+local function tick()
+    -- Primary-stat sweep rides this same timer but is otherwise independent of
+    -- the inspect rotation: it needs no NotifyInspect and never touches the
+    -- shared inspect buffer, so it runs even while an inspect is in flight (and
+    -- while the character pane is open, which only gates inspects). It
+    -- self-silences once every roster member is resolved for the current pull.
+    if ALC.Capture.PrimaryStatScan then
+        local okPS, errPS = pcall(ALC.Capture.PrimaryStatScan.tick)
+        if not okPS then
+            ALC.Core.Logger.debug("PrimaryStatScan.tick failed: " .. tostring(errPS))
+        end
+    end
+
+    -- Roster self-heal. Nothing in the WoW event model announces "that unit is
+    -- resolvable now", so members missed by the last rebuild can only be picked
+    -- up by looking again. Cheap (one UnitGUID per group slot) and it stops on
+    -- its own the moment every slot resolves, so a healthy raid pays nothing.
+    if (I.rosterUnresolved or 0) > 0
+       and (now() - (I.rosterLastBuild or 0)) >= C.INSPECT_ROSTER_REFRESH_S then
+        local before = #(I.rosterGuids or {})
+        rebuildUnitIndex()
+        local gained = #(I.rosterGuids or {}) - before
+        if gained > 0 then
+            ALC.Core.Metrics.inc("roster_refresh_gain", gained)
+            ALC.Core.Logger.debug(string.format(
+                "Roster refresh picked up %d member(s); %d slot(s) still unresolved.",
+                gained, I.rosterUnresolved))
+        end
+    end
+
+    if I.inFlight then
+        local infl = I.inFlight
+        local elapsed = now() - infl.startedAt
+
+        -- Safety net: if events fired but tryFinalize wasn't called for
+        -- some reason, finalize here. Cheap and idempotent.
+        tryFinalize()
+        if not I.inFlight then
+            -- finalized; fall through to pickNext
+        elseif not infl.gotTalent and elapsed > C.INSPECT_TIMEOUT_S then
+            -- Hard timeout: never even got the basic INSPECT_TALENT_READY.
+            -- Backoff this peer and try the next one.
+            local entry = ALC.Capture.InspectCache.get(infl.guid) or {}
+            scheduleNext(entry, "timeout")
+            ALC.Capture.InspectCache.set(infl.guid, entry)
+            if not inspectBufferInUse() then ClearInspectPlayer() end
+            I.inFlight = nil
+        else
+            return  -- still waiting for current inspect
+        end
+    end
+
+    local nextGuid = pickNext()
+    if not nextGuid then return end
+
+    local unit = resolveUnit(nextGuid)
+    if not unit then
+        -- Can't resolve GUID to any unit token right now (player out of
+        -- range, target lost, etc.). Defer 30s so we don't burn CPU on
+        -- this entry every tick.
+        -- This tick bought nothing. Counted because a cache carrying
+        -- out-of-group GUIDs presents here and nowhere else: rules 2 and 3
+        -- keep handing them back, and the deferral written below is on
+        -- next_scan_at, which rule 2 does not consult.
+        ALC.Core.Metrics.inc("inspect_unresolved")
+        local entry = ALC.Capture.InspectCache.get(nextGuid)
+        if entry then
+            entry.next_scan_at = time() + 30
+            ALC.Capture.InspectCache.set(nextGuid, entry)
+        end
+        return
+    end
+
+    local entry = ALC.Capture.InspectCache.get(nextGuid) or {}
+
+    if not canInspectUnit(unit) then
+        scheduleNext(entry, "gate_fail")
+        ALC.Capture.InspectCache.set(nextGuid, entry)
+        return
+    end
+
+    entry.last_attempt_at = time()
+    entry.attempt_count = (entry.attempt_count or 0) + 1
+    ALC.Capture.InspectCache.set(nextGuid, entry)
+
+    I.inFlight = { guid = nextGuid, startedAt = now() }
+    -- Stock 3.3.5 inspect for talents / mystic / guild / race. Gear data
+    -- now comes from LibOpenRaid's LRS broadcasts (see PeerGearListener),
+    -- so we don't need the InspectUnit + SetAlpha(0) trick that was
+    -- attempting to ripen the inspect-frame-only vanity-overlay packets.
+    -- That trick was rough (occasional frame flashes, complexity) and
+    -- still didn't reliably surface divergence. Plain NotifyInspect is
+    -- enough for the lighter fields.
+    NotifyInspect(unit)
+    if not ALC.Core.Profile.isStockClient() then
+        -- the custom client-specific: trigger CAO inspect packet. Skipped entirely when
+        -- the user has turned peer CA inspects off (see caoInspectEnabled).
+        if caoInspectEnabled()
+           and _G.C_CharacterAdvancement and type(_G.C_CharacterAdvancement.InspectUnit) == "function" then
+            pcall(_G.C_CharacterAdvancement.InspectUnit, unit)
+        end
+        -- the custom client-specific: trigger mystic enchant inspect packet
+        if ALC.Capture.MysticEnchantScan then
+            ALC.Capture.MysticEnchantScan.requestInspect(unit)
+        end
+    end
+    ALC.Core.Metrics.inc("inspect_sent")
+
+    -- Schedule a deferred vanity-overlay re-scan when transmog viewing is
+    -- on. Out-of-combat manual inspects (e.g. in Orgrimmar) reliably surface
+    -- divergence because the user keeps the frame open 5-30s. In-combat
+    -- auto-inspects need a longer read window for the same packets to
+    -- arrive. 8s is a compromise between API ripening and publish delay.
+    -- If transmog viewing is off, GetInventoryItemLink already returns the
+    -- real (non-vanity) item, so the rescan is pointless and we skip it.
+    if transmogVisible() then
+        local deferredGuid = nextGuid
+        local deferredFn = function()
+            if not UnitExists(unit) or UnitGUID(unit) ~= deferredGuid then return end
+            local cachedEntry = ALC.Capture.InspectCache.get(deferredGuid)
+            if not cachedEntry or not cachedEntry.ci or not cachedEntry.ci.gear then return end
+            if not GetInventoryItemID then return end
+
+            local newDiverges = 0
+            for _, gearEntry in ipairs(cachedEntry.ci.gear) do
+                local slot = gearEntry.slot
+                if slot then
+                    local appearanceId = GetInventoryItemID(unit, slot)
+                    if appearanceId and appearanceId ~= gearEntry.item_id
+                       and gearEntry.vanity_item_id ~= appearanceId then
+                        gearEntry.vanity_item_id = appearanceId
+                        newDiverges = newDiverges + 1
+                    end
+                end
+            end
+
+            if newDiverges > 0 then
+                -- Bump last_success_at so the next publishPeerInspects
+                -- treats this as a fresh CI worth re-enqueueing.
+                cachedEntry.last_success_at = time()
+                cachedEntry.vanity_check_attempts = nil
+                ALC.Capture.InspectCache.set(deferredGuid, cachedEntry)
+                if ALC.Capture.SnapshotPipeline and ALC.Capture.SnapshotPipeline.publishPeerInspects then
+                    ALC.Capture.SnapshotPipeline.publishPeerInspects()
+                end
+                ALC.Core.Logger.debug(string.format(
+                    "Deferred vanity-rescan patched %d slot(s) for %s and re-published.",
+                    newDiverges, UnitName(unit) or deferredGuid))
+            end
+
+            -- NOTE: this used to Hide()/SetAlpha(1) the InspectFrame to clean
+            -- up a frame ALC itself opened via InspectUnit()+SetAlpha(0). That
+            -- trick was removed (tick() now fires plain NotifyInspect, which
+            -- opens no visible frame), so the only InspectFrame that can be
+            -- shown here is the USER's own manual inspect window. Hiding it
+            -- slammed the player's inspect window shut mid-look (stock
+            -- InspectFrame is the visible inspect window on a stock-client tenant). Removed.
+        end
+
+        if _G.C_Timer and C_Timer.After then
+            C_Timer.After(8.0, deferredFn)
+        else
+            local tf = CreateFrame("Frame")
+            local startedAt = GetTime()
+            tf:SetScript("OnUpdate", function(self, el)
+                if GetTime() - startedAt >= 8.0 then
+                    self:SetScript("OnUpdate", nil); deferredFn()
+                end
+            end)
+        end
+    end
+end
+
+function I.onRosterChange()
+    rebuildUnitIndex()
+
+    -- Fold newcomers into the primary-stat sweep without discarding values
+    -- already resolved for the rest of the group this pull.
+    if ALC.Capture.PrimaryStatScan then
+        pcall(ALC.Capture.PrimaryStatScan.onRosterChange)
+    end
+
+    -- Purge entries for players no longer in group (raid + party).
+    -- UnitGUID("player") can transiently return nil during a raid disband
+    -- (PARTY_MEMBERS_CHANGED / RAID_ROSTER_UPDATE fire mid-transition).
+    -- A nil key would throw "table index is nil" on the constructor, so
+    -- bail out and let the next event tick retry; roster state is
+    -- unreliable when even the local player unit is unreadable.
+    local pg = UnitGUID("player")
+    if not pg then return end
+
+    -- The purge runs UNCONDITIONALLY. 0.70.0 skipped it whenever the roster
+    -- read was incomplete, reasoning that an unresolved slot is
+    -- indistinguishable from "left the group" so deleting is a guess. True,
+    -- but the trade was bad: with the purge suppressed the InspectCache keeps
+    -- out-of-group GUIDs, and pickNext rules 2 and 3 walk the CACHE rather
+    -- than the roster, so those entries get picked, fail to resolve, and burn
+    -- a tick each time (see the rule-2 note in pickNext - it gates on
+    -- backoff_until, which the unresolved path never sets). Raid-sized groups
+    -- have the most unresolvable slots, so they stopped purging most often;
+    -- measured 2026-08-27, first-three-pull coverage on 20+ raids fell
+    -- 11-20 points against the same loggers' own pre-0.70.0 baseline while
+    -- 5-mans were untouched. Losing one already-paid-for capture is the
+    -- cheaper mistake. See [[reference_alc_inspect_roster_index_freezes]].
+    local inRoster = { [pg] = true }
+    for guid in pairs(I.unitByGuid or {}) do
+        inRoster[guid] = true
+    end
+    for guid in pairs(ALC.Capture.InspectCache.snapshot()) do
+        if not inRoster[guid] then
+            ALC.Capture.InspectCache.delete(guid)
+        end
+    end
+end
+
+-- Event wiring
+function I.start()
+    rebuildUnitIndex()
+
+    ALC.RegisterEvent("INSPECT_TALENT_READY", onInspectReady)
+    if not ALC.Core.Profile.isStockClient() then
+        -- the custom client-specific inspect-result events. We treat any payload as
+        -- "ack received" and finalize as soon as both have fired (or 3s
+        -- after INSPECT_TALENT_READY, whichever comes first). The /alcv3
+        -- probe (2026-04-25) confirmed both events fire reliably with
+        -- result codes "CA_INSPECT_OK" / "RE_INSPECT_OK" within ~1.5s.
+        -- These events do not exist on a stock-client tenant, where INSPECT_TALENT_READY
+        -- alone carries the full payload.
+        ALC.RegisterEvent("INSPECT_CHARACTER_ADVANCEMENT_RESULT", onCAResult)
+        ALC.RegisterEvent("MYSTIC_ENCHANT_INSPECT_RESULT", onMysticResult)
+    end
+    ALC.RegisterEvent("RAID_ROSTER_UPDATE", I.onRosterChange)
+    ALC.RegisterEvent("PARTY_MEMBERS_CHANGED", I.onRosterChange)
+
+    -- OnUpdate-driven tick. Per-profile interval: 1.0s on the custom client
+    -- (a custom-client tenant-validated 24/24 at 1.0s), 0.5s on a stock-client tenant (probe-validated
+    -- 24/24 at 0.30s, 0.5s leaves margin and roughly halves cold-cycle).
+    local interval = ALC.Core.Profile.inspectIntervalSeconds()
+    local accum = 0
+    I.ticker = ALC.frame
+    I.ticker:HookScript("OnUpdate", function(self, elapsed)
+        -- Pause the auto-loop while the user has a character pane OR an
+        -- inspect window open (see inspectBufferInUse). Firing NotifyInspect
+        -- on a peer repoints the single global inspect buffer, so the frame
+        -- the user is looking at renders gear as bare slot names and the
+        -- inspected model goes naked until the buffer is restored. Same class
+        -- of global-buffer race v0.30.10 fixed for a stock-client tenant talents.
+        --
+        -- The original gate (v0.30.12) only covered the user's OWN character
+        -- pane; it missed the case where the user right-click → Inspects a
+        -- raider (the INSPECT frame, not the character pane). 0.60.1 added the
+        -- inspect-frame names here; finalizeInspect's ClearInspectPlayer is
+        -- gated on the same predicate so an in-flight peer finalizing mid-look
+        -- can't wipe the user's open window either.
+        --
+        -- Manual /alc inspect-now bypasses by calling tick() directly.
+        -- Coverage cost: up to one interval of delay when the user closes
+        -- the pane / inspect window.
+        if inspectBufferInUse() then
+            return
+        end
+        accum = accum + elapsed
+        if accum >= interval then
+            accum = 0
+            tick()
+        end
+    end)
+
+    ALC.Core.Logger.debug(string.format(
+        "InspectLoop started (profile=%s, interval=%.2fs)",
+        tostring(ALC.Profile), interval))
+end
+
+-- Manual trigger for /alc inspect-now
+function I.inspectNow(unit)
+    unit = unit or "target"
+    if not UnitExists(unit) or not UnitIsPlayer(unit) then
+        ALC.Core.Logger.warn("inspect-now: no player targeted")
+        return
+    end
+    local guid = UnitGUID(unit)
+    local entry = ALC.Capture.InspectCache.get(guid) or {}
+    entry.next_scan_at = 0
+    entry.backoff_until = 0
+    entry.inspect_unavailable = false
+    ALC.Capture.InspectCache.set(guid, entry)
+    tick()
+end
