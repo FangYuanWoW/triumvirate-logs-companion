@@ -20,7 +20,8 @@ local BRANDS = {
     triumvirate = {
         short       = "Triumvirate Logs",
         full        = "Triumvirate Logs Companion",
-        slash       = "tlc",     -- /alc still works everywhere as a universal alias (see UI/SlashCommand.lua)
+        slash       = "tlc",
+        dataAddon   = "TriumvirateLogsData",  -- written by the Uploader; public API, see UI/ProgressionTooltip.lua     -- /alc still works everywhere as a universal alias (see UI/SlashCommand.lua)
         accent      = "4ec3ff",  -- blue flame, the shared house color
         domain      = "triumlogs.gg",
         releasesUrl = "https://github.com/FangYuanWoW/triumvirate-logs-companion/releases",
@@ -28,7 +29,8 @@ local BRANDS = {
     frostmourne = {
         short       = "Frostmourne Logs",
         full        = "Frostmourne Logs Companion",
-        slash       = "flc",     -- /alc still works everywhere as a universal alias
+        slash       = "flc",
+        dataAddon   = "FrostmourneLogsData",     -- /alc still works everywhere as a universal alias
         accent      = "4ec3ff",  -- shares the blue brand color
         domain      = "frostmournelogs.gg",
         releasesUrl = "https://github.com/FangYuanWoW/frostmourne-logs-companion/releases",
@@ -65,4 +67,5 @@ function B.releasesUrl() return B.current().releasesUrl end
 -- site page that links its download. Used by the progression tooltip's
 -- "no data yet" call to action.
 function B.uploaderName() return B.current().short .. " Uploader" end
+function B.dataAddon()    return B.current().dataAddon end
 function B.downloadUrl()  return "https://" .. B.current().domain .. "/download" end

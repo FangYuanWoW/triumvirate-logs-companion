@@ -40,13 +40,15 @@ C.SV_PREFIX = C.ADDON_FOLDER:sub(1, 1):upper() .. "LC"
 C.KS_RUNS_VAR = C.SV_PREFIX .. "_KeystoneRuns"
 
 -- Version
--- 0.75.0 (raid progression on the player tooltip). Hover any player to see
+-- 0.75.0 (raid progression, All-Stars ranks and parses on the player tooltip). Hover any player to see
 -- what they have cleared this phase: one line per raid with the highest
 -- difficulty reached per raid size ("ICC 25H 7/12  10N 12/12"). Hold Shift
 -- for every size and difficulty, kill counts, earlier phases and the data's
--- age. The data is the realm's snapshot from the site, which the Logs
--- Uploader writes into Data/PlayerData.lua; it shows on the next /reload or
--- login. New Tooltip tab in the settings panel, and /tlc prog [name]. While
+-- age; the current phase also shows the main raid's All-Stars points with
+-- overall / class / spec rank and Best Perf Avg (per-boss parses on Shift).
+-- The data is a separate addon the Logs Uploader writes
+-- (TriumvirateLogsData) with a public API any addon can use; this addon
+-- reads it through that API. New data shows on the next /reload or login. New Tooltip tab in the settings panel, and /tlc prog [name]. While
 -- the data is missing or over a week old, tooltips and a daily login line
 -- point at the brand's Uploader download page.
 -- Capture and the wire format are untouched; no schema bump.
@@ -773,6 +775,8 @@ C.DEFAULT_CONFIG = {
     progression_tooltip         = true,   -- master switch
     progression_all_phases      = false,  -- compact view also lists earlier phases (Shift always does)
     progression_show_kills      = true,   -- expanded view shows total kill counts
+    progression_show_rankings   = true,   -- All-Stars points + overall/class/spec rank
+    progression_show_parses     = true,   -- Best Perf Avg (and per-boss parses with Shift)
     progression_always_expanded = false,  -- full breakdown without holding Shift
     progression_show_unlogged   = false,  -- a "no logged raid kills" line for players with no data
     progression_hide_in_combat  = true,   -- keep tooltips lean while in combat

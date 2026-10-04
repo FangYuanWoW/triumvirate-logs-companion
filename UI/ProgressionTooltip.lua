@@ -1,24 +1,19 @@
 -- UI/ProgressionTooltip.lua
--- Raid progression on the player unit tooltip.
+-- Raid progression, All-Stars rankings and parses on the player unit tooltip.
 --
--- Data comes from Data/PlayerData.lua, which the Logs Uploader rewrites with
--- the realm's snapshot (every player with a logged raid kill). Shape:
+-- The data is NOT part of this addon. The Logs Uploader writes it as a
+-- standalone data addon (TriumvirateLogsData / FrostmourneLogsData, see
+-- Branding.dataAddon) with a public Lua API that any addon can use; this file
+-- is one consumer of that API:
 --
---   ALC_PlayerData = {
---     v = 1, tenant = "triumvirate", generatedAt = <unix>, activePhase = 2,
---     phases  = { { n = 1, name = "Phase 1", raids = { 1, 2, 3, 4 } }, ... },
---     raids   = { [1] = { short = "OS", location = "Obsidian Sanctum", bosses = 1 }, ... },
---     players = { ["Fangyuan"] = "2.8.25.N.11.11;1.3.25.N.5.5", ... },
---   }
+--   local L = _G[<data addon>]; L.IsLoaded(); L.GetMeta(); L.GetProfile(who)
 --
--- A player string is entries joined by ";", each
---   <phase>.<raidId>.<size>.<diff>.<killed>.<kills>
--- size: "10" | "25" | "F" (flex) | other number; diff: "N" | "H" | "0".."3"
--- (Obsidian Sanctum drakes). killed = distinct bosses down, kills = total kills.
+-- (the .toc lists the data addon under OptionalDeps so it loads first).
 --
--- Default view: the current phase, one line per raid, the highest difficulty
--- reached per raid size. Holding Shift (or the "always expanded" setting)
--- shows every size/difficulty, kill counts, older phases and the data age.
+-- Default view: the current phase, one row per raid and size at the highest
+-- difficulty reached, then the main raid's All-Stars rank and Best Perf Avg.
+-- Holding Shift (or "always expanded") shows every size and difficulty, kill
+-- counts, every ranked raid with per-boss parses, and earlier phases.
 
 local ALC = _G.ALC
 local P = {}
@@ -37,13 +32,16 @@ local function on(key)
 end
 
 -- ---------------------------------------------------------------------------
--- Data access
+-- Data access (through the data addon's public API)
 -- ---------------------------------------------------------------------------
 
-function P.data()
-    local d = _G.ALC_PlayerData
-    if type(d) ~= "table" or type(d.players) ~= "table" then return nil end
-    return d
+-- The data addon's API table when it is installed AND has data, else nil.
+function P.lib()
+    local L = _G[ALC.Core.Branding.dataAddon()]
+    if type(L) == "table" and type(L.IsLoaded) == "function" and L.IsLoaded() then
+        return L
+    end
+    return nil
 end
 
 -- Data older than this means the Uploader has not been running.
@@ -52,9 +50,10 @@ local STALE_AFTER_S = 7 * 86400
 -- What the player should be told about the data itself, or nil when it is
 -- fine: "missing" (never synced) or "stale" (synced, but not for a week).
 function P.ctaState()
-    local d = P.data()
-    if not d then return "missing" end
-    if d.generatedAt and time() - d.generatedAt > STALE_AFTER_S then return "stale" end
+    local L = P.lib()
+    if not L then return "missing" end
+    local meta = L.GetMeta()
+    if meta and meta.generatedAt and time() - meta.generatedAt > STALE_AFTER_S then return "stale" end
     return nil
 end
 
@@ -63,8 +62,8 @@ end
 function P.ctaText(state)
     local B = ALC.Core.Branding
     if state == "stale" then
-        local d = P.data()
-        local days = math.floor((time() - (d.generatedAt or time())) / 86400)
+        local meta = P.lib().GetMeta()
+        local days = math.floor((time() - (meta.generatedAt or time())) / 86400)
         return string.format("Raid progression data is %d days old. Open the %s to refresh it.",
             days, B.uploaderName())
     end
@@ -72,70 +71,9 @@ function P.ctaText(state)
         B.uploaderName(), B.domain() .. "/download")
 end
 
--- Parsed entry lists, per player name. Built on first hover; a /reload
--- (the only way new data arrives) discards it.
-local parsed = {}
-
-local DIFF_RANK = { ["0"] = 1, ["1"] = 2, ["2"] = 3, ["3"] = 4, N = 10, H = 20 }
-local SIZE_ORDER = { ["25"] = 1, F = 2, ["10"] = 3 }
-
-local function parseEntries(raw)
-    local list = {}
-    for entry in string.gmatch(raw or "", "[^;]+") do
-        local ph, raid, size, diff, killed, kills =
-            string.match(entry, "^(%d+)%.(%d+)%.([^%.]+)%.([^%.]+)%.(%d+)%.(%d+)$")
-        if ph then
-            list[#list + 1] = {
-                phase  = tonumber(ph),
-                raid   = tonumber(raid),
-                size   = size,
-                diff   = diff,
-                killed = tonumber(killed),
-                kills  = tonumber(kills),
-            }
-        end
-    end
-    return list
-end
-
--- Look a player up by the name the client shows. Names are stored exactly as
--- the combat log wrote them, which is how UnitName returns them; the
--- case-insensitive scan is only for /tlc prog typed by hand.
-function P.lookup(name, exactOnly)
-    local d = P.data()
-    if not d or not name or name == "" then return nil end
-    if parsed[name] then return parsed[name], name end
-    local raw = d.players[name]
-    local key = name
-    if not raw and not exactOnly then
-        local lname = string.lower(name)
-        for k, v in pairs(d.players) do
-            if string.lower(k) == lname then raw, key = v, k; break end
-        end
-    end
-    if not raw then return nil end
-    parsed[key] = parseEntries(raw)
-    return parsed[key], key
-end
-
 -- ---------------------------------------------------------------------------
 -- Formatting
 -- ---------------------------------------------------------------------------
-
-local function sizeLabel(size)
-    if size == "F" then return "Flex" end
-    return size
-end
-
--- "Nm"/"Hc" after the size ("25Hc", "10Nm") - the spelling other WotLK log
--- addons use, so it reads at a glance. Obsidian Sanctum keeps its drakes
--- count ("10 1D").
-local function diffLabel(diff)
-    if diff == "N" then return "Nm" end
-    if diff == "H" then return "Hc" end
-    if string.match(diff, "^%d$") then return " " .. diff .. "D" end
-    return " " .. diff
-end
 
 local COLOR_FULL    = "1eff00"  -- full clear
 local COLOR_PARTIAL = "ffd100"  -- some bosses down
@@ -146,21 +84,62 @@ local SEPARATOR     = "- - - - - - - - - - - - - - - - - - - - - -"
 
 local function colorize(hex, s) return "|cff" .. hex .. s .. "|r" end
 
--- One tooltip row per (raid, size, difficulty): the raid and its size +
--- difficulty on the LEFT ("ICC 25H", "OS 10 1D"), the N/M on the right, so
--- every row lines up in the same two columns.
-local function rowLeft(raidShort, e)
-    local d = diffLabel(e.diff)
-    -- "Flex Hc", not "FlexHc"; numeric sizes stay glued ("25Hc").
-    if e.size == "F" and string.sub(d, 1, 1) ~= " " then d = " " .. d end
-    local label = sizeLabel(e.size) .. d
-    local labelColor = (e.diff == "H" or e.diff == "3") and COLOR_HEROIC or COLOR_LABEL
-    return " " .. raidShort .. " " .. colorize(labelColor, label)
+local DIFF_RANK  = { ["0d"] = 1, ["1d"] = 2, ["2d"] = 3, ["3d"] = 4, normal = 10, heroic = 20 }
+local SIZE_ORDER = { [25] = 1, flex = 2, [10] = 3 }
+
+local function sizeLabel(size)
+    if size == "flex" then return "Flex" end
+    return tostring(size)
 end
 
-local function rowRight(e, total, showKills)
-    local frac = e.killed .. "/" .. total
-    local fracColor = (e.killed >= total) and COLOR_FULL or COLOR_PARTIAL
+-- "Nm"/"Hc" after the size ("25Hc", "10Nm") - the spelling other WotLK log
+-- addons use, so it reads at a glance. Obsidian Sanctum keeps its drakes
+-- count ("10 1D").
+local function diffLabel(diff)
+    if diff == "normal" then return "Nm" end
+    if diff == "heroic" then return "Hc" end
+    local drakes = string.match(diff or "", "^(%d)d$")
+    if drakes then return " " .. drakes .. "D" end
+    return " " .. tostring(diff)
+end
+
+local function isHard(diff) return diff == "heroic" or diff == "3d" end
+
+local function diffColored(diff, prefix)
+    local text = (prefix or "") .. diffLabel(diff)
+    return colorize(isHard(diff) and COLOR_HEROIC or COLOR_LABEL, (string.gsub(text, "^ ", "")))
+end
+
+-- Parse colours, the scale every log site uses.
+local function parseColor(p)
+    if p >= 100 then return "e5cc80" end
+    if p >= 99 then return "e268a8" end
+    if p >= 95 then return "ff8000" end
+    if p >= 75 then return "a335ee" end
+    if p >= 50 then return "0070ff" end
+    if p >= 25 then return "1eff00" end
+    return "9d9d9d"
+end
+
+local function parseText(p)
+    if not p then return colorize(COLOR_DIM, "-") end
+    local s = (p == math.floor(p)) and tostring(p) or string.format("%.1f", p)
+    return colorize(parseColor(p), s)
+end
+
+-- One row per (raid, size, difficulty): the raid and its size + difficulty
+-- on the LEFT ("ICC 25Hc", "OS 10 1D"), the N/M on the right.
+local function rowLeft(e)
+    local d = diffLabel(e.difficulty)
+    -- "Flex Hc", not "FlexHc"; numeric sizes stay glued ("25Hc").
+    if e.size == "flex" and string.sub(d, 1, 1) ~= " " then d = " " .. d end
+    local labelColor = isHard(e.difficulty) and COLOR_HEROIC or COLOR_LABEL
+    return " " .. (e.raid or "?") .. " " .. colorize(labelColor, sizeLabel(e.size) .. d)
+end
+
+local function rowRight(e, showKills)
+    local frac = e.killed .. "/" .. (e.total or 0)
+    local fracColor = (e.killed >= (e.total or 0)) and COLOR_FULL or COLOR_PARTIAL
     local r = colorize(fracColor, frac)
     if showKills then
         r = r .. colorize(COLOR_DIM, string.format("  %d kill%s", e.kills, e.kills == 1 and "" or "s"))
@@ -171,32 +150,32 @@ end
 local function sortEntries(a, b)
     local sa, sb = SIZE_ORDER[a.size] or 9, SIZE_ORDER[b.size] or 9
     if sa ~= sb then return sa < sb end
-    return (DIFF_RANK[a.diff] or 0) > (DIFF_RANK[b.diff] or 0)
+    return (DIFF_RANK[a.difficulty] or 0) > (DIFF_RANK[b.difficulty] or 0)
 end
 
--- Entries for one phase, grouped per raid in the phase's display order.
-local function byRaid(entries, phase, raidOrder)
+-- Progression entries for one phase, grouped per raid in the phase's order.
+local function byRaid(entries, phase)
     local groups, any = {}, false
     for _, e in ipairs(entries) do
         if e.phase == phase.n then
-            groups[e.raid] = groups[e.raid] or {}
-            table.insert(groups[e.raid], e)
+            groups[e.raidId] = groups[e.raidId] or {}
+            table.insert(groups[e.raidId], e)
             any = true
         end
     end
     if not any then return nil end
     local out = {}
-    for _, raidId in ipairs(raidOrder) do
+    for _, raidId in ipairs(phase.raids or {}) do
         local g = groups[raidId]
         if g then
             table.sort(g, sortEntries)
-            out[#out + 1] = { raid = raidId, entries = g }
+            out[#out + 1] = g
         end
     end
     return out
 end
 
--- Highest difficulty per size, for the compact one-line-per-raid view.
+-- Highest difficulty per size, for the compact one-row-per-size view.
 local function bestPerSize(entries)
     local best, order = {}, {}
     for _, e in ipairs(entries) do
@@ -204,7 +183,7 @@ local function bestPerSize(entries)
         if not cur then
             best[e.size] = e
             order[#order + 1] = e.size
-        elseif (DIFF_RANK[e.diff] or 0) > (DIFF_RANK[cur.diff] or 0) then
+        elseif (DIFF_RANK[e.difficulty] or 0) > (DIFF_RANK[cur.difficulty] or 0) then
             best[e.size] = e
         end
     end
@@ -212,13 +191,6 @@ local function bestPerSize(entries)
     for _, s in ipairs(order) do out[#out + 1] = best[s] end
     table.sort(out, sortEntries)
     return out
-end
-
-local function phaseByNumber(d, n)
-    for _, ph in ipairs(d.phases or {}) do
-        if ph.n == n then return ph end
-    end
-    return nil
 end
 
 local function ago(ts)
@@ -230,17 +202,50 @@ local function ago(ts)
     return math.floor(s / 86400) .. "d old"
 end
 
+local ROLE_SUFFIX = { healer = " (Healing)", tank = " (Tank)" }
+
+local function rankText(r)
+    if not r or not r.rank then return nil end
+    return "#" .. r.rank .. (r.of and ("/" .. r.of) or "")
+end
+
+-- All-Stars + parse rows for one ranked raid.
+local function rankingRows(lines, rk, expanded)
+    if on("progression_show_rankings") then
+        local left = " All-Stars " .. (rk.raid or "?") .. " " .. diffColored(rk.difficulty)
+            .. colorize(COLOR_DIM, ROLE_SUFFIX[rk.role] or "")
+        local pts = rk.points and string.format("%d pts", math.floor(rk.points + 0.5)) or ""
+        lines[#lines + 1] = { left, pts .. "  " .. colorize(COLOR_LABEL, rankText(rk.overall) or "") }
+        local parts = {}
+        if rk.spec and rk.spec.rank then parts[#parts + 1] = rankText(rk.spec) .. " spec" end
+        if rk.class and rk.class.rank then parts[#parts + 1] = rankText(rk.class) .. " class" end
+        if #parts > 0 then
+            local specName = (rk.spec and rk.spec.name) or ""
+            lines[#lines + 1] = { "   " .. colorize(COLOR_DIM, specName), colorize(COLOR_LABEL, table.concat(parts, "  ")) }
+        end
+    end
+    if on("progression_show_parses") and rk.bestPerfAvg then
+        lines[#lines + 1] = { " Best Perf Avg", parseText(rk.bestPerfAvg) }
+        if expanded then
+            for _, b in ipairs(rk.bosses or {}) do
+                lines[#lines + 1] = { "   " .. colorize(COLOR_DIM, b.name), parseText(b.parse) }
+            end
+        end
+    end
+end
+
 -- Produce tooltip lines as { left, right } pairs (right may be nil), or nil
 -- when there is nothing to show. Shared by the tooltip and /tlc prog.
-function P.buildLines(name, expanded)
-    local d = P.data()
-    if not d then return nil end
-    local entries = P.lookup(name, true)
+function P.buildLines(who, expanded)
+    local L = P.lib()
+    if not L then return nil end
+    local meta = L.GetMeta()
+    local profile = L.GetProfile(who)
     local brand = ALC.Core.Branding
     local header = colorize(brand.current().accent, brand.short())
     local lines = {}
 
-    if not entries or #entries == 0 then
+    if not profile or #profile.progression == 0 then
         if on("progression_show_unlogged") then
             lines[1] = { header, colorize(COLOR_DIM, "no logged raid kills") }
             return lines
@@ -248,9 +253,8 @@ function P.buildLines(name, expanded)
         return nil
     end
 
-    -- Phases newest first; the current phase always leads.
     local phases = {}
-    for _, ph in ipairs(d.phases or {}) do phases[#phases + 1] = ph end
+    for _, ph in ipairs(meta.phases or {}) do phases[#phases + 1] = ph end
     table.sort(phases, function(a, b) return a.n > b.n end)
 
     local showOlder = expanded or on("progression_all_phases")
@@ -258,28 +262,32 @@ function P.buildLines(name, expanded)
     local shownAny = false
 
     for _, ph in ipairs(phases) do
-        if ph.n <= (d.activePhase or ph.n) then
-            local groups = byRaid(entries, ph, ph.raids or {})
+        if ph.n <= (meta.activePhase or ph.n) then
+            local groups = byRaid(profile.progression, ph)
             if groups then
-                -- Brand + data age is its own header line; every phase,
-                -- the current one included, gets a row of its own below it.
+                -- Brand + data age is its own header line, then a dashed rule
+                -- (tooltip only; /tlc prog skips it); every phase gets a row.
                 if not shownAny then
-                    lines[#lines + 1] = { header, colorize(COLOR_DIM, ago(d.generatedAt) or "") }
-                    -- Dashed rule under the header so the block stands apart
-                    -- from the game's own tooltip lines. Tooltip only: chat
-                    -- output (/tlc prog) skips it.
+                    lines[#lines + 1] = { header, colorize(COLOR_DIM, ago(meta.generatedAt) or "") }
                     lines[#lines + 1] = { colorize(COLOR_DIM, SEPARATOR), nil, sep = true }
                 end
                 lines[#lines + 1] = { colorize(COLOR_DIM, "Phase " .. ph.n), nil }
                 for _, g in ipairs(groups) do
-                    local raid = d.raids[g.raid] or {}
-                    local total = raid.bosses or 0
-                    local short = raid.short or "?"
-                    -- Compact: the highest difficulty per raid size. Expanded:
-                    -- every size and difficulty, with kill counts.
-                    local rows = expanded and g.entries or bestPerSize(g.entries)
+                    local rows = expanded and g or bestPerSize(g)
                     for _, e in ipairs(rows) do
-                        lines[#lines + 1] = { rowLeft(short, e), rowRight(e, total, showKills) }
+                        lines[#lines + 1] = { rowLeft(e), rowRight(e, showKills) }
+                    end
+                end
+                -- Rankings exist for the current phase only: the main raid
+                -- compact, every ranked raid expanded, in the phase's order.
+                if ph.n == meta.activePhase and #profile.rankings > 0 then
+                    local byId = {}
+                    for _, rk in ipairs(profile.rankings) do byId[rk.raidId] = rk end
+                    for _, raidId in ipairs(ph.raids or {}) do
+                        if byId[raidId] then
+                            rankingRows(lines, byId[raidId], expanded)
+                            if not expanded then break end
+                        end
                     end
                 end
                 shownAny = true
@@ -306,12 +314,12 @@ local function onSetUnit(tooltip)
     if on("progression_hide_in_combat") and InCombatLockdown() then return end
     local _, unit = tooltip:GetUnit()
     if not unit or not UnitIsPlayer(unit) then return end
-    local name, realm = UnitName(unit)
+    local _, realm = UnitName(unit)
     -- Another realm's player of the same name is someone else entirely.
     if realm and realm ~= "" then return end
-    if not P.data() then
-        -- No snapshot installed at all: one quiet line pointing at the
-        -- Uploader, instead of a feature that silently never shows anything.
+    if not P.lib() then
+        -- No data installed at all: one quiet line pointing at the Uploader,
+        -- instead of a feature that silently never shows anything.
         if on("progression_cta") then
             tooltip.alcProgressionAdded = true
             tooltip:AddLine("Raid progression: get the " .. ALC.Core.Branding.uploaderName()
@@ -320,7 +328,7 @@ local function onSetUnit(tooltip)
         end
         return
     end
-    local ok, lines = pcall(P.buildLines, name, expandedNow())
+    local ok, lines = pcall(P.buildLines, unit, expandedNow())
     if not ok or not lines then return end
     tooltip.alcProgressionAdded = true
     for _, l in ipairs(lines) do
@@ -337,6 +345,9 @@ function P.start()
     if P.installed then return end
     P.installed = true
     GameTooltip:HookScript("OnTooltipSetUnit", onSetUnit)
+    GameTooltip:HookScript("OnTooltipCleared", function(tooltip)
+        tooltip.alcProgressionAdded = nil
+    end)
     -- Give the login chat burst a moment so the reminder is not buried.
     local delay, elapsed = CreateFrame("Frame"), 0
     delay:SetScript("OnUpdate", function(self, dt)
@@ -344,9 +355,6 @@ function P.start()
         if elapsed < 8 then return end
         self:SetScript("OnUpdate", nil)
         pcall(P.chatCta)
-    end)
-    GameTooltip:HookScript("OnTooltipCleared", function(tooltip)
-        tooltip.alcProgressionAdded = nil
     end)
     -- Shift toggles the expanded view on the tooltip already showing.
     ALC.RegisterEvent("MODIFIER_STATE_CHANGED", function(_, key)
@@ -383,30 +391,30 @@ end
 
 -- One-line status for the settings tab and /tlc status.
 function P.statusText()
-    local d = P.data()
-    if not d then return P.ctaText("missing") end
-    local n = 0
-    for _ in pairs(d.players) do n = n + 1 end
-    return string.format("%d players, data %s", n, ago(d.generatedAt) or "of unknown age")
+    local L = P.lib()
+    if not L then return P.ctaText("missing") end
+    local meta = L.GetMeta()
+    return string.format("%d players, data %s", meta.players or 0, ago(meta.generatedAt) or "of unknown age")
 end
 
--- /tlc prog <name>: print a player's progression to chat.
+-- /tlc prog <name>: print a player's progression and rankings to chat.
 function P.printFor(name)
     local log = ALC.Core.Logger
-    if not P.data() then
+    local L = P.lib()
+    if not L then
         P.chatCta(true)
         return
     end
     if not name or name == "" then
         name = UnitName("target") or UnitName("player")
     end
-    local _, key = P.lookup(name)
-    local lines = key and P.buildLines(key, true)
+    local profile = L.GetProfile(name)
+    local lines = profile and P.buildLines(profile.name, true)
     if not lines then
         log.info("No logged raid kills for " .. name .. ".")
         return
     end
-    log.info(key .. ":")
+    log.info(profile.name .. ":")
     for _, l in ipairs(lines) do
         if not l.sep then
             DEFAULT_CHAT_FRAME:AddMessage("  " .. l[1] .. (l[2] and ("  " .. l[2]) or ""))

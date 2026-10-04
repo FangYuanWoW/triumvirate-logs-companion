@@ -498,7 +498,7 @@ function UI.create()
         end, function(v) cfg()[key] = v end
     end
 
-    pageHeader(tooltipPage, "RAID PROGRESSION", -4)
+    pageHeader(tooltipPage, "RAID PROGRESSION & RANKINGS", -4)
 
     local progGet, progSet = progToggle("progression_tooltip")
     local progCb = makeCheckbox(tooltipPage, "Show raid progression on player tooltips", 4, -28,
@@ -514,26 +514,34 @@ function UI.create()
     local killsCb = makeCheckbox(tooltipPage, "Show kill counts in the full breakdown", 4, -126, g, st)
     local killsHelp = helpUnder(tooltipPage, killsCb, "How many times they killed each raid, per size and difficulty.")
 
+    g, st = progToggle("progression_show_rankings")
+    local rankCb = makeCheckbox(tooltipPage, "Show All-Stars rank", 4, -170, g, st)
+    local rankHelp = helpUnder(tooltipPage, rankCb, "Points, and rank overall, in class and in spec, this phase.")
+
+    g, st = progToggle("progression_show_parses")
+    local parseCb = makeCheckbox(tooltipPage, "Show parses", 4, -214, g, st)
+    local parseHelp = helpUnder(tooltipPage, parseCb, "Best Perf Avg; hold Shift for the best parse on every boss.")
+
     g, st = progToggle("progression_always_expanded")
-    local expCb = makeCheckbox(tooltipPage, "Always show the full breakdown", 4, -170, g, st)
+    local expCb = makeCheckbox(tooltipPage, "Always show the full breakdown", 4, -258, g, st)
     local expHelp = helpUnder(tooltipPage, expCb, "Every size and difficulty without holding Shift. Makes tooltips taller.")
 
     g, st = progToggle("progression_show_unlogged")
-    local unlCb = makeCheckbox(tooltipPage, "Mark players with no logged kills", 4, -214, g, st)
+    local unlCb = makeCheckbox(tooltipPage, "Mark players with no logged kills", 4, -302, g, st)
     local unlHelp = helpUnder(tooltipPage, unlCb, "Adds a \"no logged raid kills\" line instead of showing nothing.")
 
     g, st = progToggle("progression_hide_in_combat")
-    local combatCb = makeCheckbox(tooltipPage, "Hide while in combat", 4, -258, g, st)
+    local combatCb = makeCheckbox(tooltipPage, "Hide while in combat", 4, -346, g, st)
     local combatHelp = helpUnder(tooltipPage, combatCb, "Keeps tooltips short during fights.")
 
     g, st = progToggle("progression_cta")
-    local ctaCb = makeCheckbox(tooltipPage, "Remind me when the data is missing or out of date", 4, -302, g, st)
+    local ctaCb = makeCheckbox(tooltipPage, "Remind me when the data is missing or out of date", 4, -390, g, st)
     local ctaHelp = helpUnder(tooltipPage, ctaCb, "A hint on tooltips and a chat reminder, at most once a day.")
 
-    pageHeader(tooltipPage, "DATA", -356)
+    pageHeader(tooltipPage, "DATA", -444)
 
     local dataText = tooltipPage:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    dataText:SetPoint("TOPLEFT", tooltipPage, "TOPLEFT", 8, -378)
+    dataText:SetPoint("TOPLEFT", tooltipPage, "TOPLEFT", 8, -466)
     dataText:SetWidth(360)
     dataText:SetJustifyH("LEFT")
     UI.progressionDataText = dataText
@@ -565,6 +573,8 @@ function UI.create()
         local master = progGet()
         setCheckboxEnabled(allCb, allHelp, master)
         setCheckboxEnabled(killsCb, killsHelp, master)
+        setCheckboxEnabled(rankCb, rankHelp, master)
+        setCheckboxEnabled(parseCb, parseHelp, master)
         setCheckboxEnabled(expCb, expHelp, master)
         setCheckboxEnabled(unlCb, unlHelp, master)
         setCheckboxEnabled(combatCb, combatHelp, master)

@@ -134,8 +134,9 @@ local function boot()
     -- C_Manastorm is absent). One success record per MANASTORM_LEVEL_COMPLETED.
     safeStart("ManastormScan", ALC.Capture.ManastormScan)
     safeStart("MinimapButton", ALC.UI.MinimapButton)
-    -- Raid progression on the player tooltip, from the Uploader-written
-    -- Data/Progression.lua. Read-only: hooks GameTooltip, captures nothing.
+    -- Raid progression, rankings and parses on the player tooltip, read from
+    -- the Uploader-written data addon's public API. Read-only: hooks
+    -- GameTooltip, captures nothing.
     safeStart("ProgressionTooltip", ALC.UI.ProgressionTooltip)
 
     ALC.Core.Logger.info(ALC.Core.Branding.titleGreen() .. " v" .. ALC.Core.Constants.VERSION .. " loaded.  |cffffd200/" .. ALC.Core.Branding.slash() .. "|r for settings.")

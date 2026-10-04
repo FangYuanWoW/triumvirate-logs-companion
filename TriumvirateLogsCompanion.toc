@@ -5,7 +5,7 @@
 ## Version: 0.75.0
 ## SavedVariables: ALC_Config, ALC_Peers
 ## SavedVariablesPerCharacter: ALC_LocalState, ALC_InspectCache, ALC_InspectCacheMeta, TLC_KeystoneRuns
-## OptionalDeps: Ace3
+## OptionalDeps: Ace3, TriumvirateLogsData
 
 embeds.xml
 
@@ -52,8 +52,6 @@ Zone\ZoneMonitor.lua
 
 Parser\Session.lua
 Parser\EncounterDetector.lua
-
-Data\PlayerData.lua
 
 UI\SettingsFrame.xml
 UI\SettingsFrame.lua
