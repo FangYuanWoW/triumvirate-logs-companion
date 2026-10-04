@@ -463,48 +463,158 @@ function UI.create()
         ALC.Core.Logger.info("Restored " .. restored .. " default zone(s). Zones you added yourself were kept.")
     end)
 
+    -- ---------- Tooltip page ----------
+    -- Raid progression on the player tooltip (UI/ProgressionTooltip.lua).
+    local tooltipPage = CreateFrame("Frame", nil, f)
+    tooltipPage:SetSize(388, 584)
+    tooltipPage:SetPoint("TOPLEFT", sidebar, "TOPRIGHT", 16, 0)
+    UI.tooltipPage = tooltipPage
+
+    local function pageHeader(page, text, y)
+        local h = page:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        h:SetPoint("TOPLEFT", page, "TOPLEFT", 4, y)
+        h:SetText("|cffffd200" .. text .. "|r")
+        local underline = page:CreateTexture(nil, "OVERLAY")
+        underline:SetSize(360, 1)
+        underline:SetPoint("TOPLEFT", h, "BOTTOMLEFT", 0, -3)
+        underline:SetTexture(0.4, 0.4, 0.4, 0.4)
+        return h
+    end
+
+    local function helpUnder(page, cb, text)
+        local help = page:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        help:SetPoint("TOPLEFT", cb, "BOTTOMLEFT", 29, -2)
+        help:SetWidth(340)
+        help:SetJustifyH("LEFT")
+        help:SetText("|cff888888" .. text .. "|r")
+        return help
+    end
+
+    local function progToggle(key)
+        return function()
+            local v = cfg()[key]
+            if v == nil then return ALC.Core.Constants.DEFAULT_CONFIG[key] and true or false end
+            return v and true or false
+        end, function(v) cfg()[key] = v end
+    end
+
+    pageHeader(tooltipPage, "RAID PROGRESSION", -4)
+
+    local progGet, progSet = progToggle("progression_tooltip")
+    local progCb = makeCheckbox(tooltipPage, "Show raid progression on player tooltips", 4, -28,
+        progGet, function(v) progSet(v); if UI.refreshProgressionDependents then UI.refreshProgressionDependents() end end)
+    helpUnder(tooltipPage, progCb, "Hover a player to see what they have cleared this phase, from logs uploaded to the site. Hold Shift for the full breakdown.")
+
+    local g, st
+    g, st = progToggle("progression_all_phases")
+    local allCb = makeCheckbox(tooltipPage, "Include earlier phases", 4, -82, g, st)
+    local allHelp = helpUnder(tooltipPage, allCb, "Also list earlier phases without holding Shift.")
+
+    g, st = progToggle("progression_show_kills")
+    local killsCb = makeCheckbox(tooltipPage, "Show kill counts in the full breakdown", 4, -126, g, st)
+    local killsHelp = helpUnder(tooltipPage, killsCb, "How many times they killed each raid, per size and difficulty.")
+
+    g, st = progToggle("progression_always_expanded")
+    local expCb = makeCheckbox(tooltipPage, "Always show the full breakdown", 4, -170, g, st)
+    local expHelp = helpUnder(tooltipPage, expCb, "Every size and difficulty without holding Shift. Makes tooltips taller.")
+
+    g, st = progToggle("progression_show_unlogged")
+    local unlCb = makeCheckbox(tooltipPage, "Mark players with no logged kills", 4, -214, g, st)
+    local unlHelp = helpUnder(tooltipPage, unlCb, "Adds a \"no logged raid kills\" line instead of showing nothing.")
+
+    g, st = progToggle("progression_hide_in_combat")
+    local combatCb = makeCheckbox(tooltipPage, "Hide while in combat", 4, -258, g, st)
+    local combatHelp = helpUnder(tooltipPage, combatCb, "Keeps tooltips short during fights.")
+
+    pageHeader(tooltipPage, "DATA", -312)
+
+    local dataText = tooltipPage:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    dataText:SetPoint("TOPLEFT", tooltipPage, "TOPLEFT", 8, -334)
+    dataText:SetWidth(360)
+    dataText:SetJustifyH("LEFT")
+    UI.progressionDataText = dataText
+
+    local dataHelp = tooltipPage:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    dataHelp:SetPoint("TOPLEFT", dataText, "BOTTOMLEFT", 0, -8)
+    dataHelp:SetWidth(360)
+    dataHelp:SetJustifyH("LEFT")
+    dataHelp:SetText("|cff888888The Logs Uploader keeps this data current while it runs. New data shows after a /reload or your next login.|r")
+
+    function UI.refreshProgressionStatus()
+        local P = ALC.UI.ProgressionTooltip
+        if UI.progressionDataText and P and P.statusText then
+            UI.progressionDataText:SetText(P.statusText())
+        end
+    end
+
+    function UI.refreshProgressionDependents()
+        local master = progGet()
+        setCheckboxEnabled(allCb, allHelp, master)
+        setCheckboxEnabled(killsCb, killsHelp, master)
+        setCheckboxEnabled(expCb, expHelp, master)
+        setCheckboxEnabled(unlCb, unlHelp, master)
+        setCheckboxEnabled(combatCb, combatHelp, master)
+    end
+    UI.refreshProgressionDependents()
+
     -- ---------- Tab buttons (created last so we can wire selection) ----------
     -- Monitored Zones first (default active) since users open the panel
     -- to manage zones more often than to flip core settings.
     local tabSettings, tabZones
     local allTabs = {}
 
+    local tabTooltip
+    local pages = { zones = zonesPage, settings = settingsPage, tooltip = tooltipPage }
+
+    local function showPage(name)
+        for key, page in pairs(pages) do
+            if key == name then page:Show() else page:Hide() end
+        end
+        if name == "tooltip" and UI.refreshProgressionStatus then
+            UI.refreshProgressionStatus()
+        end
+    end
+
     tabZones = makeTab(sidebar, "Monitored Zones", 0, -4, function()
         activateTab(tabZones, allTabs)
-        zonesPage:Show()
-        settingsPage:Hide()
+        showPage("zones")
     end)
 
     tabSettings = makeTab(sidebar, "Settings", 0, -36, function()
         activateTab(tabSettings, allTabs)
-        settingsPage:Show()
-        zonesPage:Hide()
+        showPage("settings")
     end)
 
-    allTabs = { tabZones, tabSettings }
+    tabTooltip = makeTab(sidebar, "Tooltip", 0, -68, function()
+        activateTab(tabTooltip, allTabs)
+        showPage("tooltip")
+    end)
+
+    allTabs = { tabZones, tabSettings, tabTooltip }
     UI.tabs = allTabs
     UI.tabZones = tabZones
     UI.tabSettings = tabSettings
+    UI.tabTooltip = tabTooltip
 
     -- Public tab-switch helper for slash commands and other external
-    -- callers. Pass "settings" or "zones".
+    -- callers. Pass "settings", "tooltip" or "zones".
     function UI.openTab(name)
         if not UI.frame then UI.create() end
         if name == "settings" then
             activateTab(tabSettings, allTabs)
-            settingsPage:Show()
-            zonesPage:Hide()
+            showPage("settings")
+        elseif name == "tooltip" then
+            activateTab(tabTooltip, allTabs)
+            showPage("tooltip")
         else
             activateTab(tabZones, allTabs)
-            zonesPage:Show()
-            settingsPage:Hide()
+            showPage("zones")
         end
     end
 
     -- Default to Monitored Zones tab
     activateTab(tabZones, allTabs)
-    zonesPage:Show()
-    settingsPage:Hide()
+    showPage("zones")
 
     -- ---------- Footer ----------
     local status = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")

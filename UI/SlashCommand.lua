@@ -26,6 +26,8 @@ local function printHelp()
     L.info("  |cffffd200" .. s .. " settings|r     open panel on Settings tab")
     L.info("  |cffffd200" .. s .. " zones|r        open panel on Monitored Zones tab")
     L.info("  |cffffd200" .. s .. " status|r       show current state")
+    L.info("  |cffffd200" .. s .. " prog [name]|r  raid progression for a player (default: target)")
+    L.info("  |cffffd200" .. s .. " tooltip|r      open panel on the Tooltip tab")
     -- Advertised on purpose, unlike the other power-user commands: this is the
     -- only way back to a dismissed keystone drain prompt.
     L.info("  |cffffd200" .. s .. " drain|r        reopen the Mythic+ send prompt")
@@ -45,12 +47,13 @@ SlashCmdList["ALC"] = function(msg)
     if cmd == "" or cmd == "gui" then
         ALC.UI.SettingsFrame.toggle()
 
-    elseif cmd == "settings" or cmd == "zones" then
+    elseif cmd == "settings" or cmd == "zones" or cmd == "tooltip" then
         -- Open the panel directly to a specific tab. /alc settings jumps to
-        -- the Settings tab; /alc zones jumps to Monitored Zones.
+        -- the Settings tab; /alc zones jumps to Monitored Zones; /alc tooltip
+        -- to the progression tooltip options.
         local f = ALC.UI.SettingsFrame.create and ALC.UI.SettingsFrame.create() or nil
         if ALC.UI.SettingsFrame.openTab then
-            ALC.UI.SettingsFrame.openTab(cmd == "settings" and "settings" or "zones")
+            ALC.UI.SettingsFrame.openTab(cmd)
         end
         if ALC.UI.SettingsFrame.refreshCheckboxes then
             ALC.UI.SettingsFrame.refreshCheckboxes()
@@ -59,6 +62,13 @@ SlashCmdList["ALC"] = function(msg)
             ALC.UI.SettingsFrame.refreshZones()
         end
         if f and not f:IsShown() then f:Show() end
+
+    elseif cmd == "prog" or cmd == "progression" then
+        -- Raid progression in chat: /tlc prog [name]. No name = your target,
+        -- else yourself. The name keeps the case the user typed (msg was
+        -- lowercased above); the lookup is case-insensitive anyway.
+        local name = msg:match("^%s*%S+%s+(%S+)")
+        ALC.UI.ProgressionTooltip.printFor(name)
 
     elseif cmd == "status" then
         local cfg = _G.ALC_Config or {}

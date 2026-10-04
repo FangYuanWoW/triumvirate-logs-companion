@@ -40,6 +40,14 @@ C.SV_PREFIX = C.ADDON_FOLDER:sub(1, 1):upper() .. "LC"
 C.KS_RUNS_VAR = C.SV_PREFIX .. "_KeystoneRuns"
 
 -- Version
+-- 0.75.0 (raid progression on the player tooltip). Hover any player to see
+-- what they have cleared this phase: one line per raid with the highest
+-- difficulty reached per raid size ("ICC 25H 7/12  10N 12/12"). Hold Shift
+-- for every size and difficulty, kill counts, earlier phases and the data's
+-- age. The data is the realm's snapshot from the site, which the Logs
+-- Uploader writes into Data/Progression.lua; it shows on the next /reload or
+-- login. New Tooltip tab in the settings panel, and /tlc prog [name].
+-- Capture and the wire format are untouched; no schema bump.
 -- 0.74.0 (Mythic+ standings keep themselves current, plus three wire frames we
 -- were throwing away). On a tenant whose M+ arrives over the AIO wire:
 --   * Own bests now refresh themselves. The server sends ReceiveTotalPoints
@@ -380,7 +388,7 @@ C.KS_RUNS_VAR = C.SV_PREFIX .. "_KeystoneRuns"
 -- of CI snapshots. Relay landed-evidence + UIErrorsFrame suppressor
 -- generalized to match the family prefix [[ALC_ so both chunk families
 -- transit cleanly through the same SPELL_CAST_FAILED hijack.
-C.VERSION = "0.74.0"
+C.VERSION = "0.75.0"
 -- Bumped to 3 in 0.2.0: snapshot header gained a `server` field
 -- ("triumvirate" | "frostmourne" | "unknown") so the backend can dispatch per-server
 -- parsing for talents / mystic / vanity.
@@ -758,4 +766,12 @@ C.DEFAULT_CONFIG = {
     -- drop. The deprecated ci_codec / ci_transport_c1 gates were removed with the
     -- legacy CI base64 path they fed.
     frame_codec          = "c2",
+    -- 0.75.0: raid progression on the player tooltip (UI/ProgressionTooltip.lua),
+    -- fed by the Uploader-written Data/Progression.lua.
+    progression_tooltip         = true,   -- master switch
+    progression_all_phases      = false,  -- compact view also lists earlier phases (Shift always does)
+    progression_show_kills      = true,   -- expanded view shows total kill counts
+    progression_always_expanded = false,  -- full breakdown without holding Shift
+    progression_show_unlogged   = false,  -- a "no logged raid kills" line for players with no data
+    progression_hide_in_combat  = true,   -- keep tooltips lean while in combat
 }
