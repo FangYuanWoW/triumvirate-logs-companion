@@ -68,7 +68,7 @@ function P.ctaText(state)
             days, B.uploaderName())
     end
     return string.format("No raid progression data yet. Get the %s from %s to see what players have cleared.",
-        B.uploaderName(), B.domain() .. "/download")
+        B.uploaderName(), B.downloadPage())
 end
 
 -- ---------------------------------------------------------------------------
@@ -344,7 +344,7 @@ local function onSetUnit(tooltip)
         if on("progression_cta") then
             tooltip.alcProgressionAdded = true
             tooltip:AddLine("Raid progression: get the " .. ALC.Core.Branding.uploaderName()
-                .. " at " .. ALC.Core.Branding.domain() .. "/download", 0.5, 0.5, 0.5, true)
+                .. " at " .. ALC.Core.Branding.downloadPage(), 0.5, 0.5, 0.5, true)
             tooltip:Show()
         end
         return

@@ -68,4 +68,5 @@ function B.releasesUrl() return B.current().releasesUrl end
 -- "no data yet" call to action.
 function B.uploaderName() return B.current().short .. " Uploader" end
 function B.dataAddon()    return B.current().dataAddon end
-function B.downloadUrl()  return "https://" .. B.current().domain .. "/download" end
+function B.downloadPage() return B.current().domain .. "/live-log-uploader" end
+function B.downloadUrl()  return "https://" .. B.downloadPage() end
