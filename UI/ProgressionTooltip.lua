@@ -127,9 +127,12 @@ local function sizeLabel(size)
     return size
 end
 
+-- "Nm"/"Hc" after the size ("25Hc", "10Nm") - the spelling other WotLK log
+-- addons use, so it reads at a glance. Obsidian Sanctum keeps its drakes
+-- count ("10 1D").
 local function diffLabel(diff)
-    if diff == "N" then return "N" end
-    if diff == "H" then return "H" end
+    if diff == "N" then return "Nm" end
+    if diff == "H" then return "Hc" end
     if string.match(diff, "^%d$") then return " " .. diff .. "D" end
     return " " .. diff
 end
@@ -139,6 +142,7 @@ local COLOR_PARTIAL = "ffd100"  -- some bosses down
 local COLOR_LABEL   = "c8c8c8"
 local COLOR_HEROIC  = "ff8000"
 local COLOR_DIM     = "808080"
+local SEPARATOR     = "- - - - - - - - - - - - - - - - - - - - - -"
 
 local function colorize(hex, s) return "|cff" .. hex .. s .. "|r" end
 
@@ -146,7 +150,10 @@ local function colorize(hex, s) return "|cff" .. hex .. s .. "|r" end
 -- difficulty on the LEFT ("ICC 25H", "OS 10 1D"), the N/M on the right, so
 -- every row lines up in the same two columns.
 local function rowLeft(raidShort, e)
-    local label = sizeLabel(e.size) .. diffLabel(e.diff)
+    local d = diffLabel(e.diff)
+    -- "Flex Hc", not "FlexHc"; numeric sizes stay glued ("25Hc").
+    if e.size == "F" and string.sub(d, 1, 1) ~= " " then d = " " .. d end
+    local label = sizeLabel(e.size) .. d
     local labelColor = (e.diff == "H" or e.diff == "3") and COLOR_HEROIC or COLOR_LABEL
     return " " .. raidShort .. " " .. colorize(labelColor, label)
 end
@@ -258,6 +265,10 @@ function P.buildLines(name, expanded)
                 -- the current one included, gets a row of its own below it.
                 if not shownAny then
                     lines[#lines + 1] = { header, colorize(COLOR_DIM, ago(d.generatedAt) or "") }
+                    -- Dashed rule under the header so the block stands apart
+                    -- from the game's own tooltip lines. Tooltip only: chat
+                    -- output (/tlc prog) skips it.
+                    lines[#lines + 1] = { colorize(COLOR_DIM, SEPARATOR), nil, sep = true }
                 end
                 lines[#lines + 1] = { colorize(COLOR_DIM, "Phase " .. ph.n), nil }
                 for _, g in ipairs(groups) do
@@ -397,6 +408,8 @@ function P.printFor(name)
     end
     log.info(key .. ":")
     for _, l in ipairs(lines) do
-        DEFAULT_CHAT_FRAME:AddMessage("  " .. l[1] .. (l[2] and ("  " .. l[2]) or ""))
+        if not l.sep then
+            DEFAULT_CHAT_FRAME:AddMessage("  " .. l[1] .. (l[2] and ("  " .. l[2]) or ""))
+        end
     end
 end
