@@ -254,14 +254,12 @@ function P.buildLines(name, expanded)
         if ph.n <= (d.activePhase or ph.n) then
             local groups = byRaid(entries, ph, ph.raids or {})
             if groups then
-                local label = "Phase " .. ph.n
-                local right = nil
-                if not shownAny and expanded then right = colorize(COLOR_DIM, ago(d.generatedAt) or "") end
+                -- Brand + data age is its own header line; every phase,
+                -- the current one included, gets a row of its own below it.
                 if not shownAny then
-                    lines[#lines + 1] = { header .. colorize(COLOR_DIM, " - " .. label), right }
-                else
-                    lines[#lines + 1] = { colorize(COLOR_DIM, label), nil }
+                    lines[#lines + 1] = { header, colorize(COLOR_DIM, ago(d.generatedAt) or "") }
                 end
+                lines[#lines + 1] = { colorize(COLOR_DIM, "Phase " .. ph.n), nil }
                 for _, g in ipairs(groups) do
                     local raid = d.raids[g.raid] or {}
                     local total = raid.bosses or 0
