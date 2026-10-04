@@ -238,7 +238,10 @@ local function rankingRows(lines, rk, expanded, showRaid, classHex)
         lines[#lines + 1] = { " Best Perf Avg", parseText(rk.bestPerfAvg) }
         if expanded then
             for _, b in ipairs(rk.bosses or {}) do
-                lines[#lines + 1] = { "   " .. colorize(COLOR_DIM, b.name), parseText(b.parse) }
+                -- "*" = provisional: a fresh best not weekly-locked yet (the
+                -- site marks it the same way).
+                local mark = (b.parse and b.provisional) and colorize(COLOR_DIM, "*") or ""
+                lines[#lines + 1] = { "   " .. colorize(COLOR_DIM, b.name), parseText(b.parse) .. mark }
             end
         end
     end

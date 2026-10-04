@@ -40,6 +40,8 @@ C.SV_PREFIX = C.ADDON_FOLDER:sub(1, 1):upper() .. "LC"
 C.KS_RUNS_VAR = C.SV_PREFIX .. "_KeystoneRuns"
 
 -- Version
+-- 0.75.1 (provisional parses). A boss parse that is fresher than the last
+-- weekly lock shows with a "*", as on the site. Tooltip only.
 -- 0.75.0 (raid progression, All-Stars ranks and parses on the player tooltip). Hover any player to see
 -- what they have cleared this phase: one line per raid with the highest
 -- difficulty reached per raid size ("ICC 25H 7/12  10N 12/12"). Hold Shift
@@ -392,7 +394,7 @@ C.KS_RUNS_VAR = C.SV_PREFIX .. "_KeystoneRuns"
 -- of CI snapshots. Relay landed-evidence + UIErrorsFrame suppressor
 -- generalized to match the family prefix [[ALC_ so both chunk families
 -- transit cleanly through the same SPELL_CAST_FAILED hijack.
-C.VERSION = "0.75.0"
+C.VERSION = "0.75.1"
 -- Bumped to 3 in 0.2.0: snapshot header gained a `server` field
 -- ("triumvirate" | "frostmourne" | "unknown") so the backend can dispatch per-server
 -- parsing for talents / mystic / vanity.

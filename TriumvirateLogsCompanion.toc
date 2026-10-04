@@ -2,7 +2,7 @@
 ## Title: |cff4ec3ffTriumvirate Logs|r |cffe8e8e8Companion|r
 ## Notes: Inspects gear and talents per encounter for triumlogs.gg. Auto-inspects the raid in the background.
 ## Author: FangYuanWoW
-## Version: 0.75.0
+## Version: 0.75.1
 ## SavedVariables: ALC_Config, ALC_Peers
 ## SavedVariablesPerCharacter: ALC_LocalState, ALC_InspectCache, ALC_InspectCacheMeta, TLC_KeystoneRuns
 ## OptionalDeps: Ace3, TriumvirateLogsData
