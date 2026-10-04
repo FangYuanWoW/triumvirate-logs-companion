@@ -60,3 +60,9 @@ function B.full()        return B.current().full end
 function B.slash()       return B.current().slash end
 function B.domain()      return B.current().domain end
 function B.releasesUrl() return B.current().releasesUrl end
+
+-- The desktop Uploader for this brand ("Triumvirate Logs Uploader") and the
+-- site page that links its download. Used by the progression tooltip's
+-- "no data yet" call to action.
+function B.uploaderName() return B.current().short .. " Uploader" end
+function B.downloadUrl()  return "https://" .. B.current().domain .. "/download" end

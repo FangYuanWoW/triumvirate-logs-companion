@@ -46,6 +46,32 @@ function P.data()
     return d
 end
 
+-- Data older than this means the Uploader has not been running.
+local STALE_AFTER_S = 7 * 86400
+
+-- What the player should be told about the data itself, or nil when it is
+-- fine: "missing" (never synced) or "stale" (synced, but not for a week).
+function P.ctaState()
+    local d = P.data()
+    if not d then return "missing" end
+    if d.generatedAt and time() - d.generatedAt > STALE_AFTER_S then return "stale" end
+    return nil
+end
+
+-- The call to action, as plain sentences (no link markup), for chat, the
+-- settings tab and the tooltip.
+function P.ctaText(state)
+    local B = ALC.Core.Branding
+    if state == "stale" then
+        local d = P.data()
+        local days = math.floor((time() - (d.generatedAt or time())) / 86400)
+        return string.format("Raid progression data is %d days old. Open the %s to refresh it.",
+            days, B.uploaderName())
+    end
+    return string.format("No raid progression data yet. Get the %s from %s to see what players have cleared.",
+        B.uploaderName(), B.domain() .. "/download")
+end
+
 -- Parsed entry lists, per player name. Built on first hover; a /reload
 -- (the only way new data arrives) discards it.
 local parsed = {}
@@ -116,12 +142,23 @@ local COLOR_DIM     = "808080"
 
 local function colorize(hex, s) return "|cff" .. hex .. s .. "|r" end
 
-local function segment(e, total)
+-- One tooltip row per (raid, size, difficulty): the raid and its size +
+-- difficulty on the LEFT ("ICC 25H", "OS 10 1D"), the N/M on the right, so
+-- every row lines up in the same two columns.
+local function rowLeft(raidShort, e)
     local label = sizeLabel(e.size) .. diffLabel(e.diff)
     local labelColor = (e.diff == "H" or e.diff == "3") and COLOR_HEROIC or COLOR_LABEL
+    return " " .. raidShort .. " " .. colorize(labelColor, label)
+end
+
+local function rowRight(e, total, showKills)
     local frac = e.killed .. "/" .. total
     local fracColor = (e.killed >= total) and COLOR_FULL or COLOR_PARTIAL
-    return colorize(labelColor, label) .. " " .. colorize(fracColor, frac)
+    local r = colorize(fracColor, frac)
+    if showKills then
+        r = r .. colorize(COLOR_DIM, string.format("  %d kill%s", e.kills, e.kills == 1 and "" or "s"))
+    end
+    return r
 end
 
 local function sortEntries(a, b)
@@ -228,19 +265,12 @@ function P.buildLines(name, expanded)
                 for _, g in ipairs(groups) do
                     local raid = d.raids[g.raid] or {}
                     local total = raid.bosses or 0
-                    local raidName = " " .. (raid.short or "?")
-                    if expanded then
-                        for _, e in ipairs(g.entries) do
-                            local r = segment(e, total)
-                            if showKills then
-                                r = r .. colorize(COLOR_DIM, string.format("  %d kill%s", e.kills, e.kills == 1 and "" or "s"))
-                            end
-                            lines[#lines + 1] = { raidName, r }
-                        end
-                    else
-                        local segs = {}
-                        for _, e in ipairs(bestPerSize(g.entries)) do segs[#segs + 1] = segment(e, total) end
-                        lines[#lines + 1] = { raidName, table.concat(segs, "   ") }
+                    local short = raid.short or "?"
+                    -- Compact: the highest difficulty per raid size. Expanded:
+                    -- every size and difficulty, with kill counts.
+                    local rows = expanded and g.entries or bestPerSize(g.entries)
+                    for _, e in ipairs(rows) do
+                        lines[#lines + 1] = { rowLeft(short, e), rowRight(e, total, showKills) }
                     end
                 end
                 shownAny = true
@@ -270,6 +300,17 @@ local function onSetUnit(tooltip)
     local name, realm = UnitName(unit)
     -- Another realm's player of the same name is someone else entirely.
     if realm and realm ~= "" then return end
+    if not P.data() then
+        -- No snapshot installed at all: one quiet line pointing at the
+        -- Uploader, instead of a feature that silently never shows anything.
+        if on("progression_cta") then
+            tooltip.alcProgressionAdded = true
+            tooltip:AddLine("Raid progression: get the " .. ALC.Core.Branding.uploaderName()
+                .. " at " .. ALC.Core.Branding.domain() .. "/download", 0.5, 0.5, 0.5, true)
+            tooltip:Show()
+        end
+        return
+    end
     local ok, lines = pcall(P.buildLines, name, expandedNow())
     if not ok or not lines then return end
     tooltip.alcProgressionAdded = true
@@ -287,6 +328,14 @@ function P.start()
     if P.installed then return end
     P.installed = true
     GameTooltip:HookScript("OnTooltipSetUnit", onSetUnit)
+    -- Give the login chat burst a moment so the reminder is not buried.
+    local delay, elapsed = CreateFrame("Frame"), 0
+    delay:SetScript("OnUpdate", function(self, dt)
+        elapsed = elapsed + dt
+        if elapsed < 8 then return end
+        self:SetScript("OnUpdate", nil)
+        pcall(P.chatCta)
+    end)
     GameTooltip:HookScript("OnTooltipCleared", function(tooltip)
         tooltip.alcProgressionAdded = nil
     end)
@@ -302,12 +351,31 @@ function P.start()
     end)
 end
 
+-- Chat reminder at login when the data is missing or stale. At most once a
+-- day (ALC_Config.progression_cta_at), and never when the tooltip or the
+-- reminder is switched off.
+local CTA_EVERY_S = 86400
+
+function P.chatCta(force)
+    local state = P.ctaState()
+    if not state then return false end
+    if not force then
+        if not on("progression_tooltip") or not on("progression_cta") then return false end
+        local last = tonumber(cfg().progression_cta_at) or 0
+        if time() - last < CTA_EVERY_S then return false end
+    end
+    if _G.ALC_Config then ALC_Config.progression_cta_at = time() end
+    local B = ALC.Core.Branding
+    local V = ALC.Transport and ALC.Transport.VersionCheck
+    local link = (V and V.urlLink) and V.urlLink(B.downloadUrl(), "Download the " .. B.uploaderName()) or B.downloadUrl()
+    ALC.Core.Logger.info(P.ctaText(state) .. " " .. link)
+    return true
+end
+
 -- One-line status for the settings tab and /tlc status.
 function P.statusText()
     local d = P.data()
-    if not d then
-        return "No progression data yet. Turn on \"In-game progression\" in the Logs Uploader, then /reload."
-    end
+    if not d then return P.ctaText("missing") end
     local n = 0
     for _ in pairs(d.players) do n = n + 1 end
     return string.format("%d players, data %s", n, ago(d.generatedAt) or "of unknown age")
@@ -317,7 +385,7 @@ end
 function P.printFor(name)
     local log = ALC.Core.Logger
     if not P.data() then
-        log.info(P.statusText())
+        P.chatCta(true)
         return
     end
     if not name or name == "" then

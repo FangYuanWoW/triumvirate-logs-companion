@@ -425,6 +425,14 @@ StaticPopupDialogs["ALC_COPY_URL"] = {
     timeout = 0, whileDead = true, hideOnEscape = true, preferredIndex = 3,
 }
 
+-- Chat hyperlink that opens the copy box above. Shared with other modules
+-- (the progression tooltip's Uploader download link); installs the hook on
+-- first use so it works even if called before start().
+function V.urlLink(url, label)
+    V.installUrlHook()
+    return "|cffffd200|Halcurl:" .. url .. "|h[" .. (label or "Click to copy URL") .. "]|h|r"
+end
+
 local urlHookInstalled = false
 local function installUrlHook()
     if urlHookInstalled then return end
@@ -439,6 +447,8 @@ local function installUrlHook()
         return origSetItemRef(link, text, button, chatFrame)
     end
 end
+
+V.installUrlHook = function() installUrlHook() end
 
 function V.maybeAnnounce()
     announceScheduled = false

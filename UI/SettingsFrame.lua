@@ -526,10 +526,14 @@ function UI.create()
     local combatCb = makeCheckbox(tooltipPage, "Hide while in combat", 4, -258, g, st)
     local combatHelp = helpUnder(tooltipPage, combatCb, "Keeps tooltips short during fights.")
 
-    pageHeader(tooltipPage, "DATA", -312)
+    g, st = progToggle("progression_cta")
+    local ctaCb = makeCheckbox(tooltipPage, "Remind me when the data is missing or out of date", 4, -302, g, st)
+    local ctaHelp = helpUnder(tooltipPage, ctaCb, "A hint on tooltips and a chat reminder, at most once a day.")
+
+    pageHeader(tooltipPage, "DATA", -356)
 
     local dataText = tooltipPage:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    dataText:SetPoint("TOPLEFT", tooltipPage, "TOPLEFT", 8, -334)
+    dataText:SetPoint("TOPLEFT", tooltipPage, "TOPLEFT", 8, -378)
     dataText:SetWidth(360)
     dataText:SetJustifyH("LEFT")
     UI.progressionDataText = dataText
@@ -538,7 +542,17 @@ function UI.create()
     dataHelp:SetPoint("TOPLEFT", dataText, "BOTTOMLEFT", 0, -8)
     dataHelp:SetWidth(360)
     dataHelp:SetJustifyH("LEFT")
-    dataHelp:SetText("|cff888888The Logs Uploader keeps this data current while it runs. New data shows after a /reload or your next login.|r")
+    dataHelp:SetText("|cff888888The " .. ALC.Core.Branding.uploaderName() .. " keeps this data current while it runs. New data shows after a /reload or your next login.|r")
+
+    -- WoW cannot open a browser, so the button hands over the link in the
+    -- shared copy box (Transport/VersionCheck.lua ALC_COPY_URL).
+    local getBtn = CreateFrame("Button", nil, tooltipPage, "UIPanelButtonTemplate")
+    getBtn:SetSize(170, 22)
+    getBtn:SetPoint("TOPLEFT", dataHelp, "BOTTOMLEFT", 0, -10)
+    getBtn:SetText("Get the Uploader")
+    getBtn:SetScript("OnClick", function()
+        StaticPopup_Show("ALC_COPY_URL", nil, nil, ALC.Core.Branding.downloadUrl())
+    end)
 
     function UI.refreshProgressionStatus()
         local P = ALC.UI.ProgressionTooltip
@@ -554,6 +568,7 @@ function UI.create()
         setCheckboxEnabled(expCb, expHelp, master)
         setCheckboxEnabled(unlCb, unlHelp, master)
         setCheckboxEnabled(combatCb, combatHelp, master)
+        setCheckboxEnabled(ctaCb, ctaHelp, master)
     end
     UI.refreshProgressionDependents()
 

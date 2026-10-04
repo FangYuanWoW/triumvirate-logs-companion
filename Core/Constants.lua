@@ -46,7 +46,9 @@ C.KS_RUNS_VAR = C.SV_PREFIX .. "_KeystoneRuns"
 -- for every size and difficulty, kill counts, earlier phases and the data's
 -- age. The data is the realm's snapshot from the site, which the Logs
 -- Uploader writes into Data/Progression.lua; it shows on the next /reload or
--- login. New Tooltip tab in the settings panel, and /tlc prog [name].
+-- login. New Tooltip tab in the settings panel, and /tlc prog [name]. While
+-- the data is missing or over a week old, tooltips and a daily login line
+-- point at the brand's Uploader download page.
 -- Capture and the wire format are untouched; no schema bump.
 -- 0.74.0 (Mythic+ standings keep themselves current, plus three wire frames we
 -- were throwing away). On a tenant whose M+ arrives over the AIO wire:
@@ -774,4 +776,5 @@ C.DEFAULT_CONFIG = {
     progression_always_expanded = false,  -- full breakdown without holding Shift
     progression_show_unlogged   = false,  -- a "no logged raid kills" line for players with no data
     progression_hide_in_combat  = true,   -- keep tooltips lean while in combat
+    progression_cta             = true,   -- "get the Uploader" hint on tooltips + a daily login reminder while data is missing/stale
 }
