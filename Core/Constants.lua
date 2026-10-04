@@ -45,7 +45,7 @@ C.KS_RUNS_VAR = C.SV_PREFIX .. "_KeystoneRuns"
 -- difficulty reached per raid size ("ICC 25H 7/12  10N 12/12"). Hold Shift
 -- for every size and difficulty, kill counts, earlier phases and the data's
 -- age. The data is the realm's snapshot from the site, which the Logs
--- Uploader writes into Data/Progression.lua; it shows on the next /reload or
+-- Uploader writes into Data/PlayerData.lua; it shows on the next /reload or
 -- login. New Tooltip tab in the settings panel, and /tlc prog [name]. While
 -- the data is missing or over a week old, tooltips and a daily login line
 -- point at the brand's Uploader download page.
@@ -769,7 +769,7 @@ C.DEFAULT_CONFIG = {
     -- legacy CI base64 path they fed.
     frame_codec          = "c2",
     -- 0.75.0: raid progression on the player tooltip (UI/ProgressionTooltip.lua),
-    -- fed by the Uploader-written Data/Progression.lua.
+    -- fed by the Uploader-written Data/PlayerData.lua.
     progression_tooltip         = true,   -- master switch
     progression_all_phases      = false,  -- compact view also lists earlier phases (Shift always does)
     progression_show_kills      = true,   -- expanded view shows total kill counts

@@ -1,5 +1,5 @@
--- Data/Progression.lua
--- Raid-progression data for the player tooltip (UI/ProgressionTooltip.lua).
+-- Data/PlayerData.lua
+-- Player data (raid progression, rankings, parses) for the player tooltip (UI/ProgressionTooltip.lua).
 --
 -- This placeholder ships EMPTY. The Logs Uploader desktop app overwrites this
 -- file with the realm's progression snapshot when "In-game progression" is on,

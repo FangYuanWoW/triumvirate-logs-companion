@@ -1,10 +1,10 @@
 -- UI/ProgressionTooltip.lua
 -- Raid progression on the player unit tooltip.
 --
--- Data comes from Data/Progression.lua, which the Logs Uploader rewrites with
+-- Data comes from Data/PlayerData.lua, which the Logs Uploader rewrites with
 -- the realm's snapshot (every player with a logged raid kill). Shape:
 --
---   ALC_ProgressionData = {
+--   ALC_PlayerData = {
 --     v = 1, tenant = "triumvirate", generatedAt = <unix>, activePhase = 2,
 --     phases  = { { n = 1, name = "Phase 1", raids = { 1, 2, 3, 4 } }, ... },
 --     raids   = { [1] = { short = "OS", location = "Obsidian Sanctum", bosses = 1 }, ... },
@@ -41,7 +41,7 @@ end
 -- ---------------------------------------------------------------------------
 
 function P.data()
-    local d = _G.ALC_ProgressionData
+    local d = _G.ALC_PlayerData
     if type(d) ~= "table" or type(d.players) ~= "table" then return nil end
     return d
 end

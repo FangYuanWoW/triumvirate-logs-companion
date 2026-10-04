@@ -53,7 +53,7 @@ Zone\ZoneMonitor.lua
 Parser\Session.lua
 Parser\EncounterDetector.lua
 
-Data\Progression.lua
+Data\PlayerData.lua
 
 UI\SettingsFrame.xml
 UI\SettingsFrame.lua
