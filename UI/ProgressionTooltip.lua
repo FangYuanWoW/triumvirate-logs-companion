@@ -210,18 +210,28 @@ local function rankText(r)
 end
 
 -- All-Stars + parse rows for one ranked raid.
-local function rankingRows(lines, rk, expanded)
+-- Rank in gold, points in cyan, spec in the player's class colour: the
+-- colours other WotLK log addons use for the same facts.
+local COLOR_RANK   = "ffd100"
+local COLOR_POINTS = "4ecdf0"
+
+local function rankingRows(lines, rk, expanded, showRaid, classHex)
     if on("progression_show_rankings") then
-        local left = " All-Stars " .. (rk.raid or "?") .. " " .. diffColored(rk.difficulty)
-            .. colorize(COLOR_DIM, ROLE_SUFFIX[rk.role] or "")
-        local pts = rk.points and string.format("%d pts", math.floor(rk.points + 0.5)) or ""
-        lines[#lines + 1] = { left, pts .. "  " .. colorize(COLOR_LABEL, rankText(rk.overall) or "") }
+        -- The raid name is already on the progression row above; it is only
+        -- repeated when several ranked raids are listed (Shift).
+        local raidPart = showRaid and ((rk.raid or "?") .. " ") or ""
+        local left = " All-Stars " .. raidPart .. diffColored(rk.difficulty)
+            .. (ROLE_SUFFIX[rk.role] and colorize(COLOR_DIM, ROLE_SUFFIX[rk.role]) or "")
+        local right = {}
+        if rk.points then right[#right + 1] = colorize(COLOR_POINTS, string.format("%d pts", math.floor(rk.points + 0.5))) end
+        if rankText(rk.overall) then right[#right + 1] = colorize(COLOR_RANK, rankText(rk.overall)) end
+        lines[#lines + 1] = { left, table.concat(right, "  ") }
         local parts = {}
-        if rk.spec and rk.spec.rank then parts[#parts + 1] = rankText(rk.spec) .. " spec" end
-        if rk.class and rk.class.rank then parts[#parts + 1] = rankText(rk.class) .. " class" end
+        if rk.spec and rk.spec.rank then parts[#parts + 1] = colorize(COLOR_RANK, rankText(rk.spec)) .. colorize(COLOR_LABEL, " spec") end
+        if rk.class and rk.class.rank then parts[#parts + 1] = colorize(COLOR_RANK, rankText(rk.class)) .. colorize(COLOR_LABEL, " class") end
         if #parts > 0 then
             local specName = (rk.spec and rk.spec.name) or ""
-            lines[#lines + 1] = { "   " .. colorize(COLOR_DIM, specName), colorize(COLOR_LABEL, table.concat(parts, "  ")) }
+            lines[#lines + 1] = { "   " .. colorize(classHex or COLOR_DIM, specName), table.concat(parts, "  ") }
         end
     end
     if on("progression_show_parses") and rk.bestPerfAvg then
@@ -244,6 +254,16 @@ function P.buildLines(who, expanded)
     local brand = ALC.Core.Branding
     local header = colorize(brand.current().accent, brand.short())
     local lines = {}
+
+    -- Class colour for the spec name, when `who` is a unit we can ask.
+    local classHex
+    if UnitExists and UnitExists(who) and UnitClass then
+        local _, token = UnitClass(who)
+        local c = token and RAID_CLASS_COLORS and RAID_CLASS_COLORS[token]
+        if c then
+            classHex = string.format("%02x%02x%02x", math.floor(c.r * 255), math.floor(c.g * 255), math.floor(c.b * 255))
+        end
+    end
 
     if not profile or #profile.progression == 0 then
         if on("progression_show_unlogged") then
@@ -285,7 +305,8 @@ function P.buildLines(who, expanded)
                     for _, rk in ipairs(profile.rankings) do byId[rk.raidId] = rk end
                     for _, raidId in ipairs(ph.raids or {}) do
                         if byId[raidId] then
-                            rankingRows(lines, byId[raidId], expanded)
+                            rankingRows(lines, byId[raidId], expanded,
+                                expanded and #profile.rankings > 1, classHex)
                             if not expanded then break end
                         end
                     end
