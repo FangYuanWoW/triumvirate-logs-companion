@@ -489,6 +489,16 @@ local function finalizeInspect()
 
         local entry = ALC.Capture.InspectCache.get(infl.guid) or {}
 
+        -- Triumvirate glyphs from the server reply to this inspect's request.
+        -- A missed or refused reply carries the last known glyphs forward
+        -- rather than blanking them (same reasoning as the empty-gear guard
+        -- below); a reply that lands after this point is patched onto the
+        -- cache by GlyphScan itself.
+        if ALC.Capture.GlyphScan and ALC.Capture.GlyphScan.isAvailable() then
+            ci.glyphs = ALC.Capture.GlyphScan.forGuid(infl.guid, infl.startedAt)
+                or (entry.ci and entry.ci.glyphs)
+        end
+
         -- Empty-gear guard (boss-transition re-inspect race). When a boss
         -- pins, EncounterTracker re-queues the whole raid for an immediate
         -- re-inspect. On the a stock-client tenant profile we finalize the moment
@@ -883,6 +893,12 @@ local function tick()
     -- still didn't reliably surface divergence. Plain NotifyInspect is
     -- enough for the lighter fields.
     NotifyInspect(unit)
+    -- Triumvirate: ask the server for this peer's glyphs in the same breath.
+    -- The reply (~180 ms) beats INSPECT_TALENT_READY + the flip delay, so it
+    -- is normally waiting when finalizeInspect runs. Inert elsewhere.
+    if ALC.Capture.GlyphScan then
+        ALC.Capture.GlyphScan.request(unit, nextGuid)
+    end
     if not ALC.Core.Profile.isStockClient() then
         -- the custom client-specific: trigger CAO inspect packet. Skipped entirely when
         -- the user has turned peer CA inspects off (see caoInspectEnabled).

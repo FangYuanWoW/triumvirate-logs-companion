@@ -394,7 +394,7 @@ C.KS_RUNS_VAR = C.SV_PREFIX .. "_KeystoneRuns"
 -- of CI snapshots. Relay landed-evidence + UIErrorsFrame suppressor
 -- generalized to match the family prefix [[ALC_ so both chunk families
 -- transit cleanly through the same SPELL_CAST_FAILED hijack.
-C.VERSION = "0.75.1"
+C.VERSION = "0.76.0"
 -- Bumped to 3 in 0.2.0: snapshot header gained a `server` field
 -- ("triumvirate" | "frostmourne" | "unknown") so the backend can dispatch per-server
 -- parsing for talents / mystic / vanity.
@@ -426,7 +426,12 @@ C.VERSION = "0.75.1"
 -- already-cached peer would keep serving a CI with no primary_stat until the
 -- normal re-inspect cadence caught up. Bumping wipes the cache and re-inspects
 -- fresh, which is the point of the release.
-C.SCHEMA_VERSION = 7
+-- Bumped to 8 in 0.76.0: Triumvirate CIs gained `glyphs` ({[1..6] = glyph
+-- spell id, 0 = empty}): local from GetGlyphSocketInfo, peers from the
+-- server's glyph-inspect reply (Capture/GlyphScan.lua). Same reason as 7: the
+-- persisted InspectCache would otherwise keep serving glyph-less peer CIs
+-- until the normal re-inspect cadence caught up.
+C.SCHEMA_VERSION = 8
 
 -- Addon channel
 C.ADDON_PREFIX = "ALC"

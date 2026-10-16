@@ -368,6 +368,12 @@ function L.buildLocalCI(sessionId)
         ci.talents = ALC.Capture.StockTalentScan.readInspectedTalents("player")
     end
 
+    -- Triumvirate: the logger's own glyphs. The stock API can read our own
+    -- sockets directly; peers come from the server via GlyphScan.
+    if ALC.Capture.GlyphScan then
+        ci.glyphs = ALC.Capture.GlyphScan.readLocal()
+    end
+
     return ci
 end
 

@@ -104,6 +104,12 @@ local function boot()
     safeStart("AddonChannel", ALC.Transport.AddonChannel)
     safeStart("VersionCheck", ALC.Transport.VersionCheck)
     safeStart("InspectLoop", ALC.Capture.InspectLoop)
+    -- GlyphScan answers InspectLoop's per-peer glyph requests off the server's
+    -- TLO whisper. Triumvirate only; nil-guarded at every call site, so a
+    -- hot-swapped session that never loaded the file just captures no glyphs.
+    if ALC.Capture.GlyphScan then
+        safeStart("GlyphScan", ALC.Capture.GlyphScan)
+    end
     safeStart("SnapshotPipeline", ALC.Capture.SnapshotPipeline)
     safeStart("PetPipeline", ALC.Capture.PetPipeline)
     -- PetTracker MUST start after SnapshotPipeline so its PLAYER_REGEN_DISABLED
