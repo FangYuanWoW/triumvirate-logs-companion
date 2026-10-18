@@ -11,9 +11,10 @@
 -- (the .toc lists the data addon under OptionalDeps so it loads first).
 --
 -- Default view: the current phase, one row per raid and size at the highest
--- difficulty reached, then the main raid's All-Stars rank and Best Perf Avg.
--- Holding Shift (or "always expanded") shows every size and difficulty, kill
--- counts, every ranked raid with per-boss parses, and earlier phases.
+-- difficulty reached, then the main raid's All-Stars rank and Best Perf Avg,
+-- once per raid size (25, Flex, 10 each have their own board). Holding Shift
+-- (or "always expanded") shows every size and difficulty, kill counts, every
+-- ranked raid with per-boss parses, and earlier phases.
 
 local ALC = _G.ALC
 local P = {}
@@ -127,14 +128,18 @@ local function parseText(p)
     return colorize(parseColor(p), s)
 end
 
+-- Size + difficulty, coloured: "25Hc", "Flex Hc", "10 1D".
+local function sizeDiffColored(size, diff)
+    local d = diffLabel(diff)
+    -- "Flex Hc", not "FlexHc"; numeric sizes stay glued ("25Hc").
+    if size == "flex" and string.sub(d, 1, 1) ~= " " then d = " " .. d end
+    return colorize(isHard(diff) and COLOR_HEROIC or COLOR_LABEL, sizeLabel(size) .. d)
+end
+
 -- One row per (raid, size, difficulty): the raid and its size + difficulty
 -- on the LEFT ("ICC 25Hc", "OS 10 1D"), the N/M on the right.
 local function rowLeft(e)
-    local d = diffLabel(e.difficulty)
-    -- "Flex Hc", not "FlexHc"; numeric sizes stay glued ("25Hc").
-    if e.size == "flex" and string.sub(d, 1, 1) ~= " " then d = " " .. d end
-    local labelColor = isHard(e.difficulty) and COLOR_HEROIC or COLOR_LABEL
-    return " " .. (e.raid or "?") .. " " .. colorize(labelColor, sizeLabel(e.size) .. d)
+    return " " .. (e.raid or "?") .. " " .. sizeDiffColored(e.size, e.difficulty)
 end
 
 local function rowRight(e, showKills)
@@ -220,7 +225,10 @@ local function rankingRows(lines, rk, expanded, showRaid, classHex)
         -- The raid name is already on the progression row above; it is only
         -- repeated when several ranked raids are listed (Shift).
         local raidPart = showRaid and ((rk.raid or "?") .. " ") or ""
-        local left = " All-Stars " .. raidPart .. diffColored(rk.difficulty)
+        -- A per-size board names its size ("25Hc"); the older All Sizes
+        -- entry has none and shows the difficulty alone ("Hc").
+        local board = rk.size and sizeDiffColored(rk.size, rk.difficulty) or diffColored(rk.difficulty)
+        local left = " All-Stars " .. raidPart .. board
             .. (ROLE_SUFFIX[rk.role] and colorize(COLOR_DIM, ROLE_SUFFIX[rk.role]) or "")
         local right = {}
         if rk.points then right[#right + 1] = colorize(COLOR_POINTS, string.format("%d pts", math.floor(rk.points + 0.5))) end
@@ -303,13 +311,27 @@ function P.buildLines(who, expanded)
                 end
                 -- Rankings exist for the current phase only: the main raid
                 -- compact, every ranked raid expanded, in the phase's order.
-                if ph.n == meta.activePhase and #profile.rankings > 0 then
-                    local byId = {}
-                    for _, rk in ipairs(profile.rankings) do byId[rk.raidId] = rk end
+                -- One block per raid size when the data has per-size boards
+                -- (sizeRankings, 25 then Flex then 10); data from an older
+                -- Uploader only has the All Sizes entry per raid.
+                local rankList = profile.rankings
+                if profile.sizeRankings and #profile.sizeRankings > 0 then
+                    rankList = profile.sizeRankings
+                end
+                if ph.n == meta.activePhase and #rankList > 0 then
+                    local byId, raidCount = {}, 0
+                    for _, rk in ipairs(rankList) do
+                        if not byId[rk.raidId] then
+                            byId[rk.raidId] = {}
+                            raidCount = raidCount + 1
+                        end
+                        table.insert(byId[rk.raidId], rk)
+                    end
                     for _, raidId in ipairs(ph.raids or {}) do
                         if byId[raidId] then
-                            rankingRows(lines, byId[raidId], expanded,
-                                expanded and #profile.rankings > 1, classHex)
+                            for _, rk in ipairs(byId[raidId]) do
+                                rankingRows(lines, rk, expanded, expanded and raidCount > 1, classHex)
+                            end
                             if not expanded then break end
                         end
                     end
